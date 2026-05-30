@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nessie-core",
+    "crates/nessie-runtime",
+    "app/src-tauri",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.78"
+license = "MIT"
+repository = "https://github.com/anton-moilanen/rs-nessie"
+authors = ["rs-nessie contributors"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+dbg_macro = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+strip = "symbols"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+debug = true

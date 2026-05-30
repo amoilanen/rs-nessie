@@ -1,0 +1,14 @@
+{
+  "name": "rs-nessie",
+  "version": "0.1.0",
+  "private": true,
+  "description": "rs-nessie — cross-platform NES emulator built with Tauri + Rust + React.",
+  "scripts": {
+    "dev": "npm --prefix app run dev",
+    "build": "npm --prefix app run build",
+    "lint": "npm --prefix app run lint",
+    "typecheck": "npm --prefix app run typecheck",
+    "test": "npm --prefix app run test",
+    "tauri": "npm --prefix app run tauri"
+  }
+}

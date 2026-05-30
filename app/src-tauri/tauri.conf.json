@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "rs-nessie",
+  "version": "0.1.0",
+  "identifier": "dev.rs-nessie",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm --prefix .. run dev",
+    "beforeBuildCommand": "npm --prefix .. run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "rs-nessie",
+        "width": 1024,
+        "height": 768,
+        "minWidth": 640,
+        "minHeight": 480,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:;"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "dmg", "deb", "rpm"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Game",
+    "shortDescription": "rs-nessie NES emulator",
+    "longDescription": "rs-nessie — a cross-platform NES emulator built with Tauri, Rust, and React."
+  },
+  "plugins": {
+    "dialog": {
+      "all": false,
+      "open": true,
+      "save": false,
+      "message": false,
+      "ask": false,
+      "confirm": false
+    }
+  }
+}

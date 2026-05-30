@@ -1,0 +1,84 @@
+name: Nightly Perf
+
+# Nightly perf-regression gate for the `nessie-core::frame` Criterion bench.
+#
+# Why nightly (not per-PR)?
+#   Shared GitHub-hosted runners exhibit run-to-run variance well above 10%
+#   on tight micro-benchmarks, so wiring the gate into every PR would be
+#   noisy and erode trust. Running it once a day on a single OS gives us a
+#   cheap "did anything obviously tank performance in the last 24h?" signal
+#   without flaking pull requests. Spec §8.3 calls this trade-off out
+#   explicitly.
+
+on:
+  schedule:
+    # 04:17 UTC every day — odd minute to avoid the top-of-hour GitHub
+    # scheduling stampede.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  perf-gate:
+    name: Frame bench perf gate
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev jq
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # A separate cache key namespace ("perf") keeps the Criterion
+          # baseline tarball from being evicted by the per-PR cache.
+          key: ${{ runner.os }}-cargo-perf-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-perf-
+
+      # Establish the baseline if the cache miss left us without one. On a
+      # warm cache this is a no-op (the second `cargo bench` below uses the
+      # stored baseline). We *always* re-save the baseline at the end of
+      # the run so the next nightly compares against fresh numbers.
+      - name: Ensure 'ci' baseline exists
+        run: |
+          if [ ! -d target/criterion/step_frame/ci ]; then
+            echo "No 'ci' baseline cached; generating one now."
+            cargo bench -p nessie-core --bench frame -- --save-baseline ci
+          else
+            echo "Reusing cached 'ci' baseline."
+          fi
+
+      - name: Run perf check (10% regression threshold)
+        run: scripts/check-perf.sh
+
+      # Refresh the baseline so the next nightly compares against today's
+      # numbers (rolling baseline). If a regression slipped past the gate
+      # we'd rather notice the *next* regression early than re-fail forever
+      # against a stale baseline.
+      - name: Refresh 'ci' baseline
+        if: success()
+        run: cargo bench -p nessie-core --bench frame -- --save-baseline ci
+
+      - name: Upload Criterion report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report
+          path: target/criterion/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,0 +1,23 @@
+[package]
+name = "nessie-runtime"
+version = "0.1.0"
+description = "Host-agnostic emulation loop, pacing, and sink traits for nessie-core"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nessie-core = { path = "../nessie-core" }
+parking_lot = "0.12"
+crossbeam-queue = "0.3"
+log = "0.4"
+
+[dev-dependencies]
+# Smoke-test only: hash the final framebuffer so the runtime path is
+# pinned to the same byte-exact output as the core-level smoke test.
+sha1 = "0.10"

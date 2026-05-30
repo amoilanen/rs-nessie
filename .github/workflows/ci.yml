@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-2022]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libasound2-dev
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            app/src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install frontend dependencies
+        run: npm --prefix app ci
+
+      - name: Lint (frontend)
+        run: npm --prefix app run lint
+
+      - name: Typecheck (frontend)
+        run: npm --prefix app run typecheck
+
+      - name: Test (frontend)
+        run: npm --prefix app run test -- --run
+
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Cargo test (workspace)
+        run: cargo test --workspace
+
+      # Explicit smoke gates (spec §8.3). They are already covered by
+      # `cargo test --workspace` above, but re-invoking them by name makes
+      # the gate visible in the CI test summary and guarantees neither test
+      # silently regresses to `#[ignore]` without breaking this job.
+      - name: Smoke test (nessie-core)
+        run: cargo test -p nessie-core --test smoke -- --nocapture
+
+      - name: Smoke test (nessie-runtime)
+        run: cargo test -p nessie-runtime --test smoke -- --nocapture
+
+      - name: Bench (Linux only, informational)
+        if: matrix.os == 'ubuntu-22.04'
+        continue-on-error: true
+        run: cargo bench -p nessie-core --bench frame -- --save-baseline ci
+
+      - name: Upload debug logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-logs-${{ matrix.os }}
+          path: |
+            target/debug/deps/*.log
+            app/src-tauri/target/debug/deps/*.log
+          if-no-files-found: ignore
+          retention-days: 7
