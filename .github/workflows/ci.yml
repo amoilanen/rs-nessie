@@ -91,6 +91,20 @@ jobs:
       - name: Smoke test (nessie-runtime)
         run: cargo test -p nessie-runtime --test smoke -- --nocapture
 
+      # End-to-end: play the committed nes15 homebrew game (boot → Start →
+      # move cursor → slide a tile) and check frames, input and audio.
+      - name: E2E game test (nes15)
+        run: cargo test -p nessie-core --test game_nes15 -- --nocapture
+
+      # Accuracy gate: blargg's public test ROMs (fetched at a pinned commit,
+      # not vendored). Emulation is deterministic and platform-independent,
+      # so one OS is enough.
+      - name: E2E accuracy suite (blargg test ROMs)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          scripts/fetch-test-roms.sh
+          cargo test -p nessie-core --release --test blargg -- --ignored --nocapture
+
       - name: Bench (Linux only, informational)
         if: matrix.os == 'ubuntu-22.04'
         continue-on-error: true

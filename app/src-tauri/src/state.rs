@@ -6,6 +6,7 @@
 //! reads.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 
 use parking_lot::Mutex;
 
@@ -27,6 +28,10 @@ pub struct AppState {
     pub settings: Mutex<Settings>,
     /// The currently-running emulator session, if any.
     pub session: Mutex<Option<EmulatorSession>>,
+    /// Source of [`EmulatorSession::session_id`] values (monotonic, so a
+    /// stale `stop_session` from a previous game can never match the
+    /// current one).
+    pub next_session_id: AtomicU64,
     /// On-disk path to the persisted `library.json`.
     pub library_path: PathBuf,
     /// On-disk path to the persisted `settings.json`.
@@ -53,6 +58,7 @@ impl AppState {
             library: Mutex::new(library),
             settings: Mutex::new(settings),
             session: Mutex::new(None),
+            next_session_id: AtomicU64::new(1),
             library_path,
             settings_path,
             saves_dir,
@@ -69,6 +75,7 @@ impl AppState {
             library: Mutex::new(Library::default()),
             settings: Mutex::new(Settings::default()),
             session: Mutex::new(None),
+            next_session_id: AtomicU64::new(1),
             library_path,
             settings_path,
             saves_dir,

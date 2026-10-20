@@ -20,6 +20,13 @@ use crate::cpu::Cpu;
 use crate::error::CoreError;
 use crate::ppu::{Ppu, FRAMEBUFFER_BYTES};
 
+/// CPU cycles the reset sequence keeps the peripherals running before the
+/// first instruction of the reset handler executes. Calibrated against
+/// blargg's `apu_reset/4017_timing`, which measures the hardware delay
+/// between the implicit `$4017` write at power/reset and the handler as
+/// 9–12 cycles (this value yields the typical 9).
+const RESET_CYCLES: u32 = 5;
+
 /// The full NES emulator state.
 pub struct Nes {
     cpu: Cpu,
@@ -62,7 +69,7 @@ impl Nes {
             nmi_pending: false,
             irq_pending: false,
         };
-        nes.reset();
+        nes.power_on();
         Ok(nes)
     }
 
@@ -91,14 +98,31 @@ impl Nes {
         self.cart.mapper_mut().load_battery(bytes);
     }
 
-    /// Hard-reset the CPU: re-pulls the reset vector and resets the PPU/APU
-    /// to their power-on states. Cartridge RAM (battery saves) is preserved.
+    /// Press the console's RESET button (a *warm* reset): the CPU re-pulls
+    /// the reset vector with `I` set and `SP` decremented by three, the PPU
+    /// returns to its reset state, and the APU is silenced (`$4015 = 0`)
+    /// with its frame counter restarted. CPU RAM and cartridge RAM (battery
+    /// saves) are preserved, exactly like on real hardware.
     pub fn reset(&mut self) {
+        self.reset_with(true);
+    }
+
+    /// Power-on sequence used by [`Nes::from_ines`].
+    fn power_on(&mut self) {
+        self.reset_with(false);
+    }
+
+    fn reset_with(&mut self, warm: bool) {
         self.ppu.reset();
-        self.apu.reset();
+        if warm {
+            self.apu.soft_reset();
+        } else {
+            self.apu.reset();
+        }
         self.nmi_pending = false;
         self.irq_pending = false;
         let mut extra_cycles: u32 = 0;
+        let mut cycles_ticked: u32 = 0;
         let Self {
             cpu,
             cart,
@@ -118,8 +142,19 @@ impl Nes {
             nmi_pending,
             irq_pending,
             extra_cycles: &mut extra_cycles,
+            cycles_ticked: &mut cycles_ticked,
         };
-        cpu.reset(&mut bus);
+        if warm {
+            cpu.soft_reset(&mut bus);
+        } else {
+            cpu.reset(&mut bus);
+        }
+        // The reset sequence occupies the bus for several cycles before the
+        // first instruction; the APU frame counter (restarted above) keeps
+        // running throughout.
+        while *bus.cycles_ticked < RESET_CYCLES {
+            bus.tick();
+        }
     }
 
     /// Set the pressed/released state of a single button on one controller.
@@ -135,6 +170,20 @@ impl Nes {
     #[inline]
     pub fn framebuffer(&self) -> &[u8; FRAMEBUFFER_BYTES] {
         self.ppu.framebuffer()
+    }
+
+    /// Read a byte from the CPU address space **without** register side
+    /// effects. Only internal RAM (`$0000-$1FFF`) and cartridge space
+    /// (`$6000-$FFFF`) are visible; PPU/APU/IO registers read as `0`.
+    ///
+    /// Intended for diagnostics and automated tests — e.g. reading the
+    /// blargg test-ROM result protocol at `$6000`.
+    pub fn peek_cpu(&mut self, addr: u16) -> u8 {
+        match addr {
+            0x0000..=0x1FFF => self.ram[(addr as usize) & 0x07FF],
+            0x6000..=0xFFFF => self.cart.mapper_mut().cpu_read(addr),
+            _ => 0,
+        }
     }
 
     /// Drain accumulated mono `f32` audio samples (at the APU's configured
@@ -165,42 +214,44 @@ impl Nes {
 
     /// Execute exactly one CPU instruction (or service one pending
     /// interrupt) and tick the PPU/APU/mapper by the same number of cycles.
-    /// Returns the total cycle count consumed (including OAM DMA stalls).
+    /// Returns the total cycle count consumed (including OAM DMA and DMC
+    /// stalls).
+    ///
+    /// The bus advances the peripherals by one CPU cycle on every memory
+    /// access the CPU performs, so PPU register accesses happen on the right
+    /// dot; any cycles of the instruction that did not touch the bus (plus
+    /// DMA stalls) are ticked here afterwards.
     fn step_one_instruction(&mut self) -> u32 {
         let mut extra_cycles: u32 = 0;
-        let cycles = {
-            let Self {
-                cpu,
-                cart,
-                ram,
-                ppu,
-                apu,
-                controllers,
-                nmi_pending,
-                irq_pending,
-            } = self;
-            let mut bus = NesBus {
-                ram,
-                cart,
-                ppu,
-                apu,
-                controllers,
-                nmi_pending,
-                irq_pending,
-                extra_cycles: &mut extra_cycles,
-            };
-            cpu.step(&mut bus)
+        let mut cycles_ticked: u32 = 0;
+        let Self {
+            cpu,
+            cart,
+            ram,
+            ppu,
+            apu,
+            controllers,
+            nmi_pending,
+            irq_pending,
+        } = self;
+        let mut bus = NesBus {
+            ram,
+            cart,
+            ppu,
+            apu,
+            controllers,
+            nmi_pending,
+            irq_pending,
+            extra_cycles: &mut extra_cycles,
+            cycles_ticked: &mut cycles_ticked,
         };
-        let total = cycles.saturating_add(extra_cycles);
-        // Advance peripherals by the same number of CPU cycles the CPU
-        // observed (instruction + OAM DMA stall).
-        self.ppu.step(total * 3, self.cart.mapper_mut());
-        if self.ppu.take_nmi() {
-            self.nmi_pending = true;
+        let cycles = cpu.step(&mut bus);
+        // `extra_cycles` can grow while we tick (a DMC fetch stalls the CPU
+        // for 4 more cycles), so re-evaluate the target every iteration.
+        while *bus.cycles_ticked < cycles.saturating_add(*bus.extra_cycles) {
+            bus.tick();
         }
-        self.apu.step(total);
-        self.cart.mapper_mut().step(total);
-        total
+        cycles.saturating_add(extra_cycles)
     }
 }
 

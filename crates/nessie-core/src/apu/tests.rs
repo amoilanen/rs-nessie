@@ -4,6 +4,14 @@
 
 use super::*;
 
+/// Write `$4017` and run the 3 CPU cycles it takes the frame sequencer to
+/// restart (writes on an even cycle take effect 3 cycles later), so the
+/// frame-counter offsets below are measured from the actual restart.
+fn write_frame_counter(apu: &mut Apu, value: u8) {
+    apu.write_register(0x4017, value);
+    apu.step(3);
+}
+
 // -----------------------------------------------------------------------
 // Pulse length counter.
 // -----------------------------------------------------------------------
@@ -15,7 +23,7 @@ use super::*;
 fn pulse_length_counter_decrements_on_half_frame_ticks() {
     let mut apu = Apu::new();
     // 4-step mode, IRQ inhibited so the test isn't polluted by IRQs.
-    apu.write_register(0x4017, 0x40);
+    write_frame_counter(&mut apu, 0x40);
     // Enable pulse 1.
     apu.write_register(0x4015, 0x01);
     // $4000: duty 0, halt = 0, constant volume, vol = 0.
@@ -38,7 +46,7 @@ fn pulse_length_counter_decrements_on_half_frame_ticks() {
 #[test]
 fn pulse_length_counter_halt_freezes_count() {
     let mut apu = Apu::new();
-    apu.write_register(0x4017, 0x40); // 4-step, IRQ off
+    write_frame_counter(&mut apu, 0x40); // 4-step, IRQ off
     apu.write_register(0x4015, 0x01); // enable pulse 1
                                       // halt = 1, constant volume, vol = 0.
     apu.write_register(0x4000, 0b0011_0000);
@@ -55,7 +63,7 @@ fn pulse_length_counter_halt_freezes_count() {
 #[test]
 fn disabling_pulse_via_4015_clears_length() {
     let mut apu = Apu::new();
-    apu.write_register(0x4017, 0x40);
+    write_frame_counter(&mut apu, 0x40);
     apu.write_register(0x4015, 0x01);
     apu.write_register(0x4000, 0b0001_0000);
     apu.write_register(0x4002, 0x00);
@@ -75,7 +83,7 @@ fn disabling_pulse_via_4015_clears_length() {
 fn status_read_clears_frame_interrupt() {
     let mut apu = Apu::new();
     // 4-step mode, IRQ enabled.
-    apu.write_register(0x4017, 0x00);
+    write_frame_counter(&mut apu, 0x00);
     // Run a full frame so the step-4 IRQ fires.
     apu.step(29830);
     assert!(apu.frame_irq, "frame IRQ should be set after one frame");
@@ -93,7 +101,7 @@ fn status_read_clears_frame_interrupt() {
 #[test]
 fn frame_irq_inhibit_suppresses_interrupt() {
     let mut apu = Apu::new();
-    apu.write_register(0x4017, 0x40); // inhibit IRQ
+    write_frame_counter(&mut apu, 0x40); // inhibit IRQ
     apu.step(29830);
     assert!(!apu.frame_irq);
     assert!(!apu.irq_pending());
@@ -146,7 +154,7 @@ fn noise_lfsr_mode1_differs_from_mode0() {
 #[test]
 fn triangle_linear_counter_reloads_with_control_flag_set() {
     let mut apu = Apu::new();
-    apu.write_register(0x4017, 0x40); // 4-step, IRQ off
+    write_frame_counter(&mut apu, 0x40); // 4-step, IRQ off
     apu.write_register(0x4015, 0x04); // enable triangle
                                       // $4008: control flag = 1, reload value = 0x3F.
     apu.write_register(0x4008, 0x80 | 0x3F);
@@ -166,7 +174,7 @@ fn triangle_linear_counter_reloads_with_control_flag_set() {
 #[test]
 fn triangle_linear_counter_decrements_when_control_clear() {
     let mut apu = Apu::new();
-    apu.write_register(0x4017, 0x40); // 4-step, IRQ off
+    write_frame_counter(&mut apu, 0x40); // 4-step, IRQ off
     apu.write_register(0x4015, 0x04); // enable triangle
                                       // First set the control flag and trigger the reload flag.
     apu.write_register(0x4008, 0x80 | 0x05);

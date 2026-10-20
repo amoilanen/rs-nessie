@@ -18,6 +18,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,7 @@ use nessie_runtime::{FrameSink, FRAME_BYTES};
 use crate::commands::rom::ensure_path_exists;
 use crate::error::{AppError, AppResult};
 use crate::library::RomId;
-use crate::session::{load_save_bytes, EmulatorSession, SessionPlayer};
+use crate::session::{load_save_bytes, EmulatorSession, HostAudio, SessionPlayer};
 use crate::state::AppState;
 
 /// IPC enumeration mirroring [`nessie_core::Button`] (named so the frontend
@@ -97,6 +98,9 @@ pub struct SessionInfo {
     pub has_battery: bool,
     /// iNES mapper number for diagnostics in the in-game HUD.
     pub mapper: u16,
+    /// Identifier of the started session; pass it to `stopSession` so a
+    /// late stop request from a previous view can't stop a newer session.
+    pub session_id: u64,
 }
 
 /// `startSession(rom, frames)` — start the emulator with `rom` as the
@@ -115,10 +119,15 @@ pub fn start_session(
     start_session_with_sink(&state, rom, sink)
 }
 
-/// `stopSession()` — stop the current session (idempotent).
+/// `stopSession(sessionId?)` — stop the current session (idempotent).
+///
+/// With a `session_id`, only that session is stopped: a request naming a
+/// session that has already been replaced is a no-op. This matters when a
+/// view unmounts while its `startSession` is still in flight and a new
+/// view has started its own session in the meantime.
 #[tauri::command]
-pub fn stop_session(state: State<'_, AppState>) -> AppResult<()> {
-    stop_session_impl(&state)
+pub fn stop_session(state: State<'_, AppState>, session_id: Option<u64>) -> AppResult<()> {
+    stop_session_matching(&state, session_id)
 }
 
 /// `setButtonState(player, button, pressed)` — forward an input transition.
@@ -132,7 +141,7 @@ pub fn set_button_state(
     set_button_state_impl(&state, player, button, pressed)
 }
 
-/// `setPaused(paused)` — pause / resume audio output.
+/// `setPaused(paused)` — freeze / resume emulation (video and audio).
 #[tauri::command]
 pub fn set_paused(state: State<'_, AppState>, paused: bool) -> AppResult<()> {
     with_active_session(&state, |s| {
@@ -207,6 +216,21 @@ pub(crate) fn start_session_with_sink<F>(
 where
     F: FrameSink + 'static,
 {
+    start_session_with_audio(state, rom, frame_sink, None)
+}
+
+/// Shared implementation of `start_session`. `audio` overrides the OS audio
+/// output (tests pass a mock); `None` opens the default device, falling back
+/// to silent output when none is available.
+pub(crate) fn start_session_with_audio<F>(
+    state: &AppState,
+    rom: RomSource,
+    frame_sink: Arc<F>,
+    audio: Option<Arc<dyn HostAudio>>,
+) -> AppResult<SessionInfo>
+where
+    F: FrameSink + 'static,
+{
     // Stop any session that was already running so the host always holds
     // at most one active emulation thread (spec §6.1).
     {
@@ -219,12 +243,20 @@ where
 
     let rom_bytes = resolve_rom_bytes(state, &rom)?;
     let save_bytes = load_pre_existing_save(&state.saves_dir, &rom_bytes)?;
-    let session =
-        EmulatorSession::start(&rom_bytes, save_bytes, state.saves_dir.clone(), frame_sink)?;
+    let saves_dir = state.saves_dir.clone();
+    let mut session = match audio {
+        Some(audio) => {
+            EmulatorSession::start_with(&rom_bytes, save_bytes, saves_dir, audio, frame_sink)?
+        }
+        None => EmulatorSession::start(&rom_bytes, save_bytes, saves_dir, frame_sink)?,
+    };
+    let session_id = state.next_session_id.fetch_add(1, Ordering::Relaxed);
+    session.set_session_id(session_id);
     let info = SessionInfo {
         sha1: session.sha1().to_owned(),
         has_battery: session.save_path().is_some(),
         mapper: parse_mapper_only(&rom_bytes)?,
+        session_id,
     };
     *state.session.lock() = Some(session);
     Ok(info)
@@ -237,10 +269,18 @@ pub(crate) fn install_session(state: &AppState, session: EmulatorSession) {
     *state.session.lock() = Some(session);
 }
 
-pub(crate) fn stop_session_impl(state: &AppState) -> AppResult<()> {
+/// Stop the active session if `session_id` is `None` or names it.
+pub(crate) fn stop_session_matching(state: &AppState, session_id: Option<u64>) -> AppResult<()> {
     let mut slot = state.session.lock();
-    if let Some(mut session) = slot.take() {
-        session.stop()?;
+    let matches = match (slot.as_ref(), session_id) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(active), Some(id)) => active.session_id() == id,
+    };
+    if matches {
+        if let Some(mut session) = slot.take() {
+            session.stop()?;
+        }
     }
     Ok(())
 }
@@ -332,7 +372,6 @@ mod tests {
 
     use super::*;
     use crate::commands::rom::import_rom_from_path_impl;
-    use crate::session::HostAudio;
 
     fn nrom_bytes() -> Vec<u8> {
         let mut rom = Vec::with_capacity(16 + 16 * 1024 + 8 * 1024);
@@ -428,7 +467,7 @@ mod tests {
         frame_sink: Arc<MockFrames>,
     ) -> SessionInfo {
         let audio = MockAudio::new();
-        let session = EmulatorSession::start_with(
+        let mut session = EmulatorSession::start_with(
             rom_bytes,
             None,
             state.saves_dir.clone(),
@@ -436,10 +475,13 @@ mod tests {
             frame_sink,
         )
         .expect("session should start with mock audio");
+        let session_id = state.next_session_id.fetch_add(1, Ordering::Relaxed);
+        session.set_session_id(session_id);
         let info = SessionInfo {
             sha1: session.sha1().to_owned(),
             has_battery: session.save_path().is_some(),
             mapper: 0,
+            session_id,
         };
         install_session(state, session);
         info
@@ -457,16 +499,114 @@ mod tests {
         install_test_session(&state, &nrom_bytes(), frames);
 
         // First stop: tears down the session.
-        stop_session_impl(&state).unwrap();
+        stop_session_matching(&state, None).unwrap();
         assert!(state.session.lock().is_none());
         // Second stop is a no-op (idempotent contract).
-        stop_session_impl(&state).unwrap();
+        stop_session_matching(&state, None).unwrap();
+    }
+
+    #[test]
+    fn stale_stop_request_does_not_stop_a_newer_session() {
+        let (_dir, state) = fixture_state();
+        // View A starts a session, then view B replaces it before A's late
+        // stop request arrives (React StrictMode double-mount, fast
+        // navigation between games).
+        let first = install_test_session(&state, &nrom_bytes(), MockFrames::new());
+        let second = install_test_session(&state, &nrom_bytes(), MockFrames::new());
+        assert_ne!(first.session_id, second.session_id);
+
+        stop_session_matching(&state, Some(first.session_id)).unwrap();
+        assert!(
+            state.session.lock().is_some(),
+            "a stale stop must leave the newer session running"
+        );
+
+        stop_session_matching(&state, Some(second.session_id)).unwrap();
+        assert!(state.session.lock().is_none());
+    }
+
+    /// Frame sink that keeps the most recent frame, for content checks.
+    struct LastFrame {
+        count: AtomicUsize,
+        last: PlMutex<Option<Vec<u8>>>,
+    }
+
+    impl FrameSink for LastFrame {
+        fn submit(&self, frame: &[u8; FRAME_BYTES], _frame_index: u64) {
+            *self.last.lock() = Some(frame.to_vec());
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl LastFrame {
+        fn wait_for_frames(&self, n: usize) -> Vec<u8> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while self.count.load(Ordering::Relaxed) < n {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for frames"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            self.last.lock().clone().expect("a frame was submitted")
+        }
+    }
+
+    /// Full command-path E2E with a real public homebrew game (nes15,
+    /// BSD-licensed, shared with the `nessie-core` E2E tests): import the
+    /// file into the library, start it by library id, press Start through
+    /// `set_button_state`, and verify the streamed frames change from the
+    /// title screen to the game board.
+    #[test]
+    fn library_rom_plays_through_the_command_layer() {
+        const NES15: &[u8] =
+            include_bytes!("../../../../crates/nessie-core/tests/fixtures/nes15-NTSC.nes");
+        let (dir, state) = fixture_state();
+        let rom_path = dir.path().join("nes15.nes");
+        fs::write(&rom_path, NES15).unwrap();
+        let entry =
+            import_rom_from_path_impl(&state, rom_path.to_string_lossy().to_string()).unwrap();
+        assert_eq!(entry.mapper, 0);
+
+        let frames = Arc::new(LastFrame {
+            count: AtomicUsize::new(0),
+            last: PlMutex::new(None),
+        });
+        let audio = MockAudio::new();
+        let info = start_session_with_audio(
+            &state,
+            RomSource::Library { id: entry.id },
+            Arc::clone(&frames),
+            Some(audio.clone() as Arc<dyn HostAudio>),
+        )
+        .unwrap();
+        assert_eq!(info.mapper, 0);
+        assert!(!info.has_battery);
+
+        // Title screen after ~2 s of (real-time paced) emulation.
+        let title = frames.wait_for_frames(120);
+        let distinct: std::collections::HashSet<&[u8]> = title.chunks_exact(4).collect();
+        assert!(distinct.len() >= 4, "title screen should be drawn");
+
+        // Press Start like the keyboard handler does.
+        set_button_state_impl(&state, 1, NesButton::Start, true).unwrap();
+        frames.wait_for_frames(130);
+        set_button_state_impl(&state, 1, NesButton::Start, false).unwrap();
+        let board = frames.wait_for_frames(250);
+        assert_ne!(board, title, "Start should leave the title screen");
+        assert!(
+            audio.samples.lock().iter().any(|s| s.abs() > 0.001),
+            "the game's music should reach the audio sink"
+        );
+
+        stop_session_matching(&state, Some(info.session_id)).unwrap();
+        assert!(state.session.lock().is_none());
     }
 
     #[test]
     fn stop_session_without_an_active_session_is_ok() {
         let (_dir, state) = fixture_state();
-        stop_session_impl(&state).unwrap();
+        stop_session_matching(&state, None).unwrap();
     }
 
     #[test]
@@ -483,7 +623,7 @@ mod tests {
 
         // Without a session: still OK (soft no-op) but only when a session
         // is present do we route. Stop it and confirm no error.
-        stop_session_impl(&state).unwrap();
+        stop_session_matching(&state, None).unwrap();
         set_button_state_impl(&state, 1, NesButton::A, false).unwrap();
     }
 

@@ -23,6 +23,11 @@ panic = "warn"
 todo = "warn"
 dbg_macro = "warn"
 
+# The emulator core runs millions of PPU dots per second; keep it optimized
+# even in `tauri dev` / debug builds so games play at full speed there.
+[profile.dev.package.nessie-core]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = "thin"

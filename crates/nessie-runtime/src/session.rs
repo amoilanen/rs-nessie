@@ -10,6 +10,8 @@
 //! - `start` / `start_with` — spawn the thread.
 //! - `set_button` — write a button state through an `AtomicU8` per player
 //!   (one bit per [`Button`] in the canonical NES order).
+//! - `set_paused` — freeze / resume emulation (the thread idles while
+//!   paused and re-syncs its frame pacing on resume).
 //! - `stop` — request shutdown and join the thread. Idempotent.
 //!
 //! Inputs are written by the host from any thread and read by the emulation
@@ -88,6 +90,7 @@ impl Default for SessionOptions {
 /// Handle to a running emulation thread.
 pub struct Session {
     shutdown: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     inputs: [Arc<AtomicU8>; 2],
     join: Option<JoinHandle<()>>,
 }
@@ -126,10 +129,12 @@ impl Session {
         C: Clock + 'static,
     {
         let shutdown = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let inputs: [Arc<AtomicU8>; 2] = [Arc::new(AtomicU8::new(0)), Arc::new(AtomicU8::new(0))];
 
         let join = {
             let shutdown = Arc::clone(&shutdown);
+            let paused = Arc::clone(&paused);
             let inputs = [Arc::clone(&inputs[0]), Arc::clone(&inputs[1])];
             // `Builder::spawn` only fails when the OS refuses to create a
             // thread (typically: process out of file descriptors / TIDs). At
@@ -139,16 +144,36 @@ impl Session {
             thread::Builder::new()
                 .name("nessie-emu".into())
                 .spawn(move || {
-                    run_emulation(nes, audio, frame, options, clock, shutdown, inputs);
+                    let control = ThreadControl {
+                        shutdown,
+                        paused,
+                        inputs,
+                    };
+                    run_emulation(nes, audio, frame, options, clock, control);
                 })
                 .expect("failed to spawn nessie-emu thread")
         };
 
         Self {
             shutdown,
+            paused,
             inputs,
             join: Some(join),
         }
+    }
+
+    /// Freeze (`true`) or resume (`false`) emulation. While paused the
+    /// emulation thread stops stepping frames — no video frames are
+    /// submitted and no audio is produced — but keeps honouring
+    /// [`Session::stop`].
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+    }
+
+    /// `true` while emulation is paused via [`Session::set_paused`].
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
     }
 
     /// Forward a key event to the emulation thread. The new bitmap is read
@@ -213,6 +238,17 @@ impl Drop for Session {
     }
 }
 
+/// How often a paused emulation thread wakes up to check for resume /
+/// shutdown.
+const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Shared flags the host uses to steer the emulation thread.
+struct ThreadControl {
+    shutdown: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    inputs: [Arc<AtomicU8>; 2],
+}
+
 /// Body of the emulation thread.
 fn run_emulation<A, F, C>(
     mut nes: Nes,
@@ -220,8 +256,7 @@ fn run_emulation<A, F, C>(
     frame: Arc<F>,
     options: SessionOptions,
     clock: C,
-    shutdown: Arc<AtomicBool>,
-    inputs: [Arc<AtomicU8>; 2],
+    control: ThreadControl,
 ) where
     A: AudioSink,
     F: FrameSink,
@@ -237,12 +272,30 @@ fn run_emulation<A, F, C>(
     // `Nes` (cheaper than re-issuing all 8 buttons every frame).
     let mut last_inputs = [0u8; 2];
     let mut submitted: u64 = 0;
+    let mut was_paused = false;
+    let ThreadControl {
+        shutdown,
+        paused,
+        inputs,
+    } = control;
 
     while !shutdown.load(Ordering::Acquire) {
         if let Some(limit) = options.stop_after_frames {
             if submitted >= limit {
                 break;
             }
+        }
+
+        if paused.load(Ordering::Acquire) {
+            was_paused = true;
+            thread::sleep(PAUSE_POLL_INTERVAL);
+            continue;
+        }
+        if was_paused {
+            // Resume from "now" instead of rushing through the frames that
+            // would have been due while we were paused.
+            pacer.resync();
+            was_paused = false;
         }
 
         // 1. Drain pending button changes into the Nes.
@@ -331,6 +384,8 @@ mod tests {
 
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     use super::*;
     use nessie_core::Nes;
@@ -448,6 +503,61 @@ mod tests {
         assert_eq!(session.button_state(Player::Two) & 0x08, 0x08);
         session.set_button(Player::One, Button::A, false);
         assert_eq!(session.button_state(Player::One) & 0x01, 0);
+        session.stop();
+        assert!(!session.is_running());
+    }
+
+    #[test]
+    fn paused_session_stops_submitting_frames_until_resumed() {
+        let nes = Nes::from_ines(&idle_rom()).unwrap();
+        let audio = Arc::new(CountingAudioSink {
+            samples: AtomicUsize::new(0),
+            rate: 44_100,
+        });
+        let frame = Arc::new(CountingFrameSink {
+            frames: AtomicUsize::new(0),
+            last_index: parking_lot::Mutex::new(None),
+        });
+        // Real-time pacing (≈16.7 ms/frame) so the pause lands long before
+        // the frame budget is exhausted.
+        let opts = SessionOptions {
+            paced: true,
+            stop_after_frames: Some(10),
+            ..Default::default()
+        };
+        let mut session = Session::start_with(nes, audio, Arc::clone(&frame), opts, SystemClock);
+        session.set_paused(true);
+        assert!(session.is_paused());
+        // Let any frame that was mid-flight when we paused land.
+        thread::sleep(Duration::from_millis(50));
+        let frozen = frame.frames.load(Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            frame.frames.load(Ordering::Relaxed),
+            frozen,
+            "no frames may be submitted while paused"
+        );
+        assert!(session.is_running(), "a paused session keeps its thread");
+
+        session.set_paused(false);
+        session.wait().expect("session thread should not panic");
+        assert_eq!(frame.frames.load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn stop_interrupts_a_paused_session() {
+        let nes = Nes::from_ines(&idle_rom()).unwrap();
+        let audio = Arc::new(CountingAudioSink {
+            samples: AtomicUsize::new(0),
+            rate: 44_100,
+        });
+        let frame = Arc::new(CountingFrameSink {
+            frames: AtomicUsize::new(0),
+            last_index: parking_lot::Mutex::new(None),
+        });
+        let mut session =
+            Session::start_with(nes, audio, frame, SessionOptions::default(), SystemClock);
+        session.set_paused(true);
         session.stop();
         assert!(!session.is_running());
     }

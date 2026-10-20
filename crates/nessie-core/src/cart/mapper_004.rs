@@ -9,7 +9,14 @@
 //! The IRQ counter is clocked by rising edges of PPU address line A12. The
 //! cleanest place to observe these in this code base is inside [`ppu_read`],
 //! so the mapper tracks the previous A12 state itself rather than relying on
-//! the PPU to call a dedicated entry point.
+//! the PPU to call a dedicated entry point. Like the real chip, rises are
+//! filtered: A12 must have been low for at least three CPU (M2) cycles,
+//! which the mapper counts through [`Mapper::step`]. This turns the
+//! back-to-back sprite pattern fetches on dots 257–320 into exactly one clock
+//! per scanline.
+//!
+//! PRG-RAM at `$6000-$7FFF` is enabled at power-on; `$A001` can disable or
+//! write-protect it (many games never touch `$A001`).
 //!
 //! When the counter is zero (or a reload was requested with `$C001`) the next
 //! A12 rising edge reloads from the latch; otherwise it decrements. Hitting
@@ -48,6 +55,10 @@ pub struct Mapper004 {
 
     /// Tracks the last observed A12 state for rising-edge detection.
     last_a12: bool,
+    /// CPU (M2) cycles elapsed, advanced by [`Mapper::step`].
+    m2_cycles: u64,
+    /// `m2_cycles` value when A12 last went low.
+    a12_low_since: u64,
 
     prg_bank_count_8k: usize,
     chr_bank_count_1k: usize,
@@ -81,13 +92,16 @@ impl Mapper004 {
             bank_regs: [0; 8],
             bank_select: 0,
             mirroring,
-            prg_ram_protect: 0,
+            // RAM enabled and writable until the game says otherwise.
+            prg_ram_protect: 0x80,
             irq_counter: 0,
             irq_latch: 0,
             irq_reload: false,
             irq_enabled: false,
             irq_pending: false,
             last_a12: false,
+            m2_cycles: 0,
+            a12_low_since: 0,
             prg_bank_count_8k,
             chr_bank_count_1k,
         }
@@ -185,11 +199,15 @@ impl Mapper004 {
     }
 
     /// Inspect the address bit 12 of a PPU access and clock the IRQ counter on
-    /// a 0→1 transition.
+    /// a filtered 0→1 transition (A12 low for at least 3 M2 cycles).
     fn observe_a12(&mut self, addr: u16) {
         let a12 = addr & 0x1000 != 0;
         if a12 && !self.last_a12 {
-            self.clock_irq_counter();
+            if self.m2_cycles.wrapping_sub(self.a12_low_since) >= 3 {
+                self.clock_irq_counter();
+            }
+        } else if !a12 && self.last_a12 {
+            self.a12_low_since = self.m2_cycles;
         }
         self.last_a12 = a12;
     }
@@ -304,8 +322,16 @@ impl Mapper for Mapper004 {
         self.mirroring
     }
 
+    fn ppu_address_changed(&mut self, addr: u16) {
+        self.observe_a12(addr);
+    }
+
     fn irq_pending(&self) -> bool {
         self.irq_pending
+    }
+
+    fn step(&mut self, cycles: u32) {
+        self.m2_cycles = self.m2_cycles.wrapping_add(u64::from(cycles));
     }
 
     fn battery_ram(&self) -> Option<&[u8]> {
@@ -349,11 +375,12 @@ mod tests {
         chr
     }
 
-    /// Pulse PPU A12 high then low to clock the IRQ counter once.
+    /// Pulse PPU A12 low (long enough to pass the M2 filter) then high to
+    /// clock the IRQ counter once.
     fn pulse_a12(m: &mut Mapper004) {
-        // Read at $1000 (A12=1) then $0000 (A12=0).
-        let _ = m.ppu_read(0x1000);
         let _ = m.ppu_read(0x0000);
+        m.step(4);
+        let _ = m.ppu_read(0x1000);
     }
 
     #[test]
@@ -507,6 +534,41 @@ mod tests {
         pulse_a12(&mut m); // reload
         pulse_a12(&mut m); // 1 → 0, but disabled
         assert!(!m.irq_pending());
+    }
+
+    #[test]
+    fn prg_ram_is_enabled_at_power_on() {
+        let mut m = Mapper004::new(
+            prg_8k_markers(4),
+            chr_1k_markers(8),
+            Mirroring::Horizontal,
+            false,
+            false,
+        );
+        m.cpu_write(0x6000, 0x5A);
+        assert_eq!(m.cpu_read(0x6000), 0x5A);
+    }
+
+    #[test]
+    fn a12_rises_closer_than_three_m2_cycles_are_filtered() {
+        let mut m = Mapper004::new(
+            prg_8k_markers(4),
+            chr_1k_markers(8),
+            Mirroring::Horizontal,
+            false,
+            false,
+        );
+        m.cpu_write(0xC000, 5); // latch
+        m.cpu_write(0xC001, 0); // reload
+        m.cpu_write(0xE001, 0); // enable
+        pulse_a12(&mut m); // reload → 5
+                           // Sprite-fetch style toggling: low/high within one M2 cycle.
+        for _ in 0..8 {
+            let _ = m.ppu_read(0x0000);
+            let _ = m.ppu_read(0x1000);
+        }
+        pulse_a12(&mut m); // 5 → 4
+        assert_eq!(m.irq_counter, 4);
     }
 
     #[test]

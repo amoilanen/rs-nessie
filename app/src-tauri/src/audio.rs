@@ -201,6 +201,12 @@ impl CpalAudio {
         self.inner.muted.store(muted, Ordering::Release);
     }
 
+    /// Discard every queued sample so playback falls silent immediately
+    /// (used when emulation is paused) instead of draining the ~250 ms ring.
+    pub fn flush(&self) {
+        while self.inner.ring.pop().is_some() {}
+    }
+
     /// Source sample rate this sink was configured with.
     #[must_use]
     pub fn source_sample_rate(&self) -> u32 {

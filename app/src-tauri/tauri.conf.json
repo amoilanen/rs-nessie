@@ -39,15 +39,5 @@
     "category": "Game",
     "shortDescription": "rs-nessie NES emulator",
     "longDescription": "rs-nessie — a cross-platform NES emulator built with Tauri, Rust, and React."
-  },
-  "plugins": {
-    "dialog": {
-      "all": false,
-      "open": true,
-      "save": false,
-      "message": false,
-      "ask": false,
-      "confirm": false
-    }
   }
 }

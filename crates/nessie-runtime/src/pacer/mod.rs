@@ -111,6 +111,15 @@ impl<C: Clock> FramePacer<C> {
         }
     }
 
+    /// Re-anchor the schedule so the next frame is due one frame period from
+    /// now. Used after the emulation was paused, so resuming neither bursts
+    /// through "missed" frames nor waits for a stale deadline.
+    pub fn resync(&mut self) {
+        let now = self.clock.now();
+        let elapsed = Duration::from_secs_f64(self.frame_index as f64 * self.frame_period_secs);
+        self.start = now.checked_sub(elapsed).unwrap_or(now);
+    }
+
     /// Mark the current frame as rendered and return the new frame index.
     #[inline]
     pub fn advance(&mut self) -> u64 {

@@ -170,6 +170,11 @@ export interface SessionInfo {
   has_battery: boolean;
   /** iNES mapper number. */
   mapper: number;
+  /**
+   * Identifier of the started session. Pass it to `stopSession` so a late
+   * stop from an unmounted view cannot stop a newer session.
+   */
+  session_id: number;
 }
 
 /**
