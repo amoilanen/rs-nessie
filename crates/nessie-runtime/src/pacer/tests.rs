@@ -176,6 +176,37 @@ fn catch_up_skips_after_a_stall_without_over_running() {
 }
 
 #[test]
+fn resync_after_a_pause_schedules_the_next_frame_one_period_out() {
+    let t0 = Instant::now();
+    let clock = FakeClock::new(t0);
+    let mut pacer = FramePacer::new(&clock, 44_100);
+    let period = frame_period();
+    for _ in 0..3 {
+        clock.advance(period);
+        pacer.advance();
+    }
+
+    // Paused for 10 s: without a resync the pacer would consider ~600
+    // frames overdue.
+    clock.advance(Duration::from_secs(10));
+    assert_eq!(pacer.wait_for_next_frame(), Duration::ZERO);
+
+    pacer.resync();
+    assert_eq!(pacer.frame_index(), 3, "resync keeps the frame index");
+    let wait = pacer.wait_for_next_frame();
+    let slack = Duration::from_micros(2);
+    assert!(
+        wait + slack >= period && wait <= period + slack,
+        "expected ≈one period until the next frame, got {wait:?}"
+    );
+    assert_eq!(
+        pacer.catch_up(2, 1_000),
+        0,
+        "nothing to catch up after resync"
+    );
+}
+
+#[test]
 fn catch_up_is_a_noop_when_inside_threshold() {
     let t0 = Instant::now();
     let clock = FakeClock::new(t0);

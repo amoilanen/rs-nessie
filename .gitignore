@@ -23,6 +23,8 @@ coverage/
 
 # Logs
 *.log
+# ...but golden trace logs are committed test fixtures.
+!crates/*/tests/fixtures/*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

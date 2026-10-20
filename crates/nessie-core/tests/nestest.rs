@@ -10,14 +10,16 @@
 //! 1. The disassembly column (cols 16..=47) is dropped.
 //! 2. The `PPU:DDD,DDD` field is dropped (the PPU is not implemented yet).
 //!
-//! Only the **documented-opcode** portion is retained: lines 1..=5003 of the
-//! original log. Line 5004 begins the undocumented-opcode tests, which
-//! `nessie-core` deliberately does not implement (FR-2).
+//! The whole log is retained (8,991 lines): the documented-opcode tests
+//! (lines 1..=5003) followed by the unofficial-opcode tests (`LAX`, `SAX`,
+//! `DCP`, `ISC`, `SLO`, `RLA`, `SRE`, `RRA`, multi-byte `NOP`s, …), which
+//! the CPU implements because real games use them.
 //!
-//! The exact awk transformation used to produce the golden log:
+//! The exact awk transformation used to produce the golden log (after
+//! stripping the upstream file's CRLF line endings):
 //!
 //! ```text
-//! awk 'NR<=5003 {
+//! awk '{
 //!   pc = substr($0, 1, 4);
 //!   b1 = substr($0, 7, 2);
 //!   b2 = substr($0, 10, 2);
@@ -83,7 +85,7 @@ fn format_trace(cpu: &Cpu, bytes: &[u8]) -> String {
 }
 
 #[test]
-fn nestest_documented_opcodes_match_golden_trace() {
+fn nestest_full_trace_matches_golden_log() {
     let mut cart = parse_ines(NESTEST_ROM).expect("nestest.nes must parse");
     let mut ram = [0u8; CPU_RAM_SIZE];
     let mut ppu = Ppu::new();
@@ -92,6 +94,7 @@ fn nestest_documented_opcodes_match_golden_trace() {
     let mut nmi_pending = false;
     let mut irq_pending = false;
     let mut extra_cycles: u32 = 0;
+    let mut cycles_ticked: u32 = 0;
     let mut bus = NesBus {
         ram: &mut ram,
         cart: &mut cart,
@@ -101,6 +104,7 @@ fn nestest_documented_opcodes_match_golden_trace() {
         nmi_pending: &mut nmi_pending,
         irq_pending: &mut irq_pending,
         extra_cycles: &mut extra_cycles,
+        cycles_ticked: &mut cycles_ticked,
     };
     let mut cpu = Cpu::new();
 

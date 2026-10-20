@@ -221,7 +221,7 @@ describe('library wrappers', () => {
 
 describe('emulator wrappers', () => {
   it('startSession forwards the rom source and the channel under "frames"', async () => {
-    const info = { sha1: 'a'.repeat(40), has_battery: false, mapper: 0 };
+    const info = { sha1: 'a'.repeat(40), has_battery: false, mapper: 0, session_id: 1 };
     invokeMock.mockResolvedValueOnce(info);
     const channel = new Channel<FrameMessage>();
     const result = await startSession({ kind: 'library', id: ROM_ID }, channel);
@@ -250,6 +250,12 @@ describe('emulator wrappers', () => {
     invokeMock.mockResolvedValueOnce(undefined);
     await stopSession();
     expect(invokeMock).toHaveBeenCalledWith('stop_session', undefined);
+  });
+
+  it('stopSession forwards the session id when given', async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    await stopSession(7);
+    expect(invokeMock).toHaveBeenCalledWith('stop_session', { sessionId: 7 });
   });
 
   it('setButtonState forwards player, button, and pressed', async () => {

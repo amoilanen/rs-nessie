@@ -54,11 +54,16 @@ pub struct NesBus<'a> {
     pub irq_pending: &'a mut bool,
     /// Extra CPU cycles consumed by side-effects observed during the
     /// current CPU step but not accounted for in the instruction's nominal
-    /// cycle count (currently: the 513-cycle OAM DMA stall on writes to
-    /// `$4014`). The owning [`crate::Nes`] facade reads and clears this
-    /// after each `Cpu::step` so the PPU/APU advance by the right number of
-    /// cycles.
+    /// cycle count (the 513-cycle OAM DMA stall on writes to `$4014`, and
+    /// the 4-cycle DMC sample-fetch stalls). The owning [`crate::Nes`]
+    /// facade ticks the peripherals through these after each `Cpu::step`.
     pub extra_cycles: &'a mut u32,
+    /// Number of CPU cycles the peripherals have already been advanced by
+    /// during the current CPU step. Every bus access ticks the PPU (3 dots),
+    /// the APU and the mapper by one CPU cycle *before* the access is
+    /// performed, so register reads/writes observe the PPU at the right dot.
+    /// The facade ticks the remainder of the instruction's cycles afterwards.
+    pub cycles_ticked: &'a mut u32,
 }
 
 impl<'a> NesBus<'a> {
@@ -66,10 +71,28 @@ impl<'a> NesBus<'a> {
     pub fn mapper(&mut self) -> &mut dyn Mapper {
         self.cart.mapper_mut()
     }
+
+    /// Advance every peripheral by one CPU cycle: three PPU dots, one APU
+    /// cycle (servicing DMC sample DMA from cartridge space) and one mapper
+    /// cycle. Latches a PPU NMI edge into [`NesBus::nmi_pending`].
+    pub fn tick(&mut self) {
+        self.ppu.step(1, self.cart.mapper_mut());
+        if self.ppu.take_nmi() {
+            *self.nmi_pending = true;
+        }
+        let cart = &mut *self.cart;
+        let stall = self
+            .apu
+            .step_with_memory(1, |addr| cart.mapper_mut().cpu_read(addr));
+        *self.extra_cycles = self.extra_cycles.saturating_add(stall);
+        self.cart.mapper_mut().step(1);
+        *self.cycles_ticked = self.cycles_ticked.saturating_add(1);
+    }
 }
 
 impl CpuBus for NesBus<'_> {
     fn read(&mut self, addr: u16) -> u8 {
+        self.tick();
         match addr {
             0x0000..=0x1FFF => {
                 let idx = (addr as usize) & 0x07FF;
@@ -78,14 +101,18 @@ impl CpuBus for NesBus<'_> {
             0x2000..=0x3FFF => self.ppu.read_register(addr, self.cart.mapper_mut()),
             0x4015 => self.apu.read_status(),
             0x4000..=0x4014 => 0, // APU write-only registers read as open bus (0).
-            0x4016 => self.controllers[0].read() & 0x01,
-            0x4017 => self.controllers[1].read() & 0x01,
+            // Bits 1-4 are not driven by a standard controller; bits 5-7 are
+            // open bus and, on a stock NES, read back the high byte of the
+            // address ($40). Some games (e.g. Paperboy) depend on that.
+            0x4016 => (self.controllers[0].read() & 0x01) | 0x40,
+            0x4017 => (self.controllers[1].read() & 0x01) | 0x40,
             0x4018..=0x401F => 0, // Test-mode registers, open bus on consumer NES.
             0x4020..=0xFFFF => self.cart.mapper_mut().cpu_read(addr),
         }
     }
 
     fn write(&mut self, addr: u16, value: u8) {
+        self.tick();
         match addr {
             0x0000..=0x1FFF => {
                 let idx = (addr as usize) & 0x07FF;
@@ -179,6 +206,7 @@ mod tests {
         nmi: bool,
         irq: bool,
         extra: u32,
+        ticked: u32,
     }
 
     impl BusOwners {
@@ -191,6 +219,7 @@ mod tests {
                 nmi: false,
                 irq: false,
                 extra: 0,
+                ticked: 0,
             }
         }
         fn bus<'a>(&'a mut self, cart: &'a mut Cartridge) -> NesBus<'a> {
@@ -203,6 +232,7 @@ mod tests {
                 nmi_pending: &mut self.nmi,
                 irq_pending: &mut self.irq,
                 extra_cycles: &mut self.extra,
+                cycles_ticked: &mut self.ticked,
             }
         }
     }
@@ -281,11 +311,12 @@ mod tests {
         let mut bus = owners.bus(&mut cart);
         bus.write(0x4016, 1);
         bus.write(0x4016, 0);
-        // P1: A=1, B=0, Select=0, Start=1, …
-        let p1: Vec<u8> = (0..8).map(|_| bus.read(0x4016)).collect();
+        // P1: A=1, B=0, Select=0, Start=1, … (bit 0 only; the upper bits
+        // are open bus).
+        let p1: Vec<u8> = (0..8).map(|_| bus.read(0x4016) & 0x01).collect();
         assert_eq!(p1, vec![1, 0, 0, 1, 0, 0, 0, 0]);
         // P2: A=0, B=1, …
-        let p2: Vec<u8> = (0..8).map(|_| bus.read(0x4017)).collect();
+        let p2: Vec<u8> = (0..8).map(|_| bus.read(0x4017) & 0x01).collect();
         assert_eq!(p2, vec![0, 1, 0, 0, 0, 0, 0, 0]);
     }
 
@@ -304,7 +335,10 @@ mod tests {
         bus.write(0x2003, 0); // OAMADDR = 0
         for i in 0u16..256 {
             let i8 = i as u8;
-            assert_eq!(bus.read(0x2004), i8, "oam[{}]", i);
+            // Bits 2-4 of each sprite's attribute byte (offset 2) are not
+            // implemented in OAM and read back as zero.
+            let expected = if i % 4 == 2 { i8 & 0xE3 } else { i8 };
+            assert_eq!(bus.read(0x2004), expected, "oam[{}]", i);
             // OAMDATA reads on real hardware leave OAMADDR unchanged; we
             // explicitly bump it to walk through OAM.
             bus.write(0x2003, i8.wrapping_add(1));

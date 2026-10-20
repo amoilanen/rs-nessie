@@ -81,3 +81,28 @@ pub fn run() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// Tauri 2 deserializes `plugins.<name>` into each plugin's config type
+    /// at startup and aborts the app if that fails. The dialog plugin takes
+    /// no configuration (its config type is `()`), so a Tauri-1-style
+    /// `"dialog": { "open": true, … }` block made the app exit immediately
+    /// with "invalid type: map, expected unit". Permissions belong in
+    /// `capabilities/` instead.
+    #[test]
+    fn tauri_conf_has_no_config_for_unit_config_plugins() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid JSON");
+        let plugins = conf.get("plugins");
+        for name in ["dialog", "store"] {
+            let entry = plugins.and_then(|p| p.get(name));
+            assert!(
+                entry.map_or(true, serde_json::Value::is_null),
+                "plugins.{name} must not be configured in tauri.conf.json: {entry:?}"
+            );
+        }
+    }
+}

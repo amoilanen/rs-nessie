@@ -27,12 +27,11 @@ use nessie_runtime::{AudioSink, FrameSink, Session, SessionOptions, SystemClock,
 use parking_lot::Mutex;
 use sha1::{Digest, Sha1};
 
-/// SHA-1 of `[0u8; 256 * 240 * 4]` — i.e. an entirely black RGBA framebuffer.
-/// The smoke ROM never enables rendering, so the PPU framebuffer is exactly
-/// this value at the end of frame 120. Identical to the digest used by
-/// `nessie-core/tests/smoke.rs`; sharing the constant is intentional so any
-/// future change to the fixture has to be reflected in both tests.
-const EXPECTED_FRAME_SHA1: &str = "64646545171a7f81dfcd027089d1f38a7f81b82b";
+/// SHA-1 of a 256×240 RGBA framebuffer filled with NES colour `$00`
+/// (`84, 84, 84, 255`). The smoke ROM never enables rendering, so the PPU
+/// shows the power-on backdrop colour on every pixel — the same digest the
+/// `nessie-core` smoke test pins.
+const EXPECTED_FRAME_SHA1: &str = "737081037b395e1b2b2f525d9f37f33320c45a9f";
 
 /// Locate the shared `smoke.nes` fixture relative to this crate's manifest
 /// dir. The runtime crate does not own a copy of the fixture — it borrows

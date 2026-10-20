@@ -2,37 +2,36 @@
 //!
 //! Scope of this implementation:
 //!
-//! - **Timing**: cycle-accurate frame counter (341 dots × 262 scanlines per
-//!   frame). The vblank flag is set on the canonical (scanline 241, dot 1)
-//!   beat and cleared on (scanline 261, dot 1). NMI is generated at the
-//!   vblank edge when [`PPUCTRL`] bit 7 is set, matching the standard NES
-//!   wiring.
-//! - **Rendering**: scanline-accurate background and sprite rendering. The
-//!   PPU produces an RGBA8 256×240 framebuffer using a canonical NTSC color
-//!   palette. Rendering happens at dot 256 of each visible scanline so the
-//!   v/t/x registers reflect the start-of-scanline scroll state.
-//! - **Sprite evaluation**: standard 8-sprite-per-scanline limit with
-//!   sprite-zero hit detection and sprite-overflow flag (faithful to the
-//!   real hardware quirk: only 8 sprites are scanned per scanline, and
-//!   overflow is asserted when a 9th is found).
+//! - **Timing**: dot-accurate frame (341 dots × 262 scanlines, with the
+//!   odd-frame dot skip when rendering is enabled). The vblank flag is set
+//!   on the canonical (scanline 241, dot 1) beat and cleared on
+//!   (scanline 261, dot 1). NMI is generated on the rising edge of
+//!   `PPUCTRL.7 && PPUSTATUS.7`, matching the standard NES wiring.
+//! - **Rendering**: the real background fetch pipeline — nametable /
+//!   attribute / pattern fetches every 8 dots into 16-bit shift registers,
+//!   with the "loopy" `v`/`t`/`x`/`w` scroll registers updated exactly when
+//!   the hardware does (coarse-X increment every 8 dots, fine-Y increment at
+//!   dot 256, horizontal `t → v` copy at dot 257, vertical copy on dots
+//!   280–304 of the pre-render line). Mid-frame scroll / nametable / pattern
+//!   changes (status bars, split screens) therefore render correctly.
+//! - **Sprites**: per-scanline evaluation (8-sprite limit, overflow flag),
+//!   pattern fetches on dots 257–320 (so MMC3's A12-driven scanline counter
+//!   sees the same address pattern as on hardware), 8×8 and 8×16 sprites,
+//!   flipping, priority, and dot-accurate sprite-zero hit.
 //! - **VRAM / palette / OAM**: 2 KB nametable RAM, 32 B palette RAM with
 //!   the standard $3F10/14/18/1C → $3F00/04/08/0C mirrors, and 256 B OAM.
+//!   Greyscale (`PPUMASK.0`) is honoured.
+//! - **Registers**: `$2007` read buffer, the PPU's I/O data-bus latch
+//!   (open bus) for write-only registers and the low bits of `$2002`.
+//! - **Output**: the framebuffer is double-buffered; [`Ppu::framebuffer`]
+//!   always returns the last *completed* frame.
 //! - **Mapper interaction**: the PPU does not own CHR memory. CHR reads and
 //!   writes go through the active [`Mapper`]; nametable mirroring also
-//!   delegates to [`Mapper::mirroring`] so MMC1-style mode changes propagate.
+//!   delegates to [`Mapper::mirroring`] so mapper-driven mode changes
+//!   propagate.
 //!
-//! What this *does not* do:
-//!
-//! - Dot-accurate background tile fetcher pipeline (we still render
-//!   correctly because we read the same memory at the end of each scanline;
-//!   tests that depend on mid-scanline timing of the v register, e.g.
-//!   raster split games, are out of scope for this milestone).
-//! - PPU bus open-bus behavior on register reads.
-//! - DMC sample fetch jitter on OAM DMA.
-//!
-//! These approximations are sufficient for the spec's PPU acceptance bar
-//! (deterministic framebuffer hashes on hand-crafted scenes; sprite-zero
-//! hit on overlap with rendering enabled; vblank/NMI timing tests).
+//! Not modelled: colour emphasis bits, open-bus decay, sprite-overflow
+//! hardware bug, and the exact `$2002` read / vblank-set race suppression.
 
 use crate::cart::Mapper;
 
@@ -59,26 +58,20 @@ pub const PRE_RENDER_SCANLINE: u16 = 261;
 
 // PPUCTRL bit masks.
 mod ctrl {
-    pub const NAMETABLE_LO: u8 = 1 << 0;
-    pub const NAMETABLE_HI: u8 = 1 << 1;
     pub const VRAM_INCREMENT: u8 = 1 << 2;
     pub const SPRITE_PATTERN: u8 = 1 << 3;
     pub const BG_PATTERN: u8 = 1 << 4;
     pub const SPRITE_SIZE: u8 = 1 << 5;
-    pub const _MASTER_SLAVE: u8 = 1 << 6;
     pub const NMI_ENABLE: u8 = 1 << 7;
 }
 
 // PPUMASK bit masks.
 mod mask {
-    pub const _GRAYSCALE: u8 = 1 << 0;
+    pub const GRAYSCALE: u8 = 1 << 0;
     pub const SHOW_BG_LEFT8: u8 = 1 << 1;
     pub const SHOW_SPR_LEFT8: u8 = 1 << 2;
     pub const SHOW_BG: u8 = 1 << 3;
     pub const SHOW_SPR: u8 = 1 << 4;
-    pub const _EMPHASIZE_R: u8 = 1 << 5;
-    pub const _EMPHASIZE_G: u8 = 1 << 6;
-    pub const _EMPHASIZE_B: u8 = 1 << 7;
 }
 
 // PPUSTATUS bit masks.
@@ -88,19 +81,30 @@ mod status_bits {
     pub const VBLANK: u8 = 1 << 7;
 }
 
-/// Per-scanline sprite information held in the secondary OAM.
+/// One sprite selected for the scanline being drawn, with its pattern bytes
+/// already fetched (and horizontally pre-flipped).
 #[derive(Debug, Clone, Copy, Default)]
-struct SpriteEntry {
-    /// Sprite index in primary OAM. Used to detect "sprite 0".
-    oam_index: u8,
-    /// Y coordinate (top of sprite, already decoded).
-    y: u8,
-    /// Tile index.
-    tile: u8,
-    /// Attribute byte (palette/priority/flip).
-    attr: u8,
+struct LineSprite {
     /// X coordinate (left of sprite).
     x: u8,
+    /// Attribute byte (palette/priority/flip).
+    attr: u8,
+    /// Pattern plane 0 (bit 7 = leftmost pixel).
+    lo: u8,
+    /// Pattern plane 1 (bit 7 = leftmost pixel).
+    hi: u8,
+    /// `true` for OAM entry 0 (sprite-zero hit candidate).
+    is_zero: bool,
+}
+
+/// Sprite found by evaluation, waiting for its pattern fetch.
+#[derive(Debug, Clone, Copy, Default)]
+struct EvaluatedSprite {
+    y: u8,
+    tile: u8,
+    attr: u8,
+    x: u8,
+    is_zero: bool,
 }
 
 /// The NES 2C02 picture processing unit state.
@@ -110,6 +114,8 @@ pub struct Ppu {
     mask: u8,
     status: u8,
     oam_addr: u8,
+    /// Last value driven on the PPU's CPU-facing data bus (open bus).
+    io_latch: u8,
 
     // === Internal "loopy" registers. ===
     /// Current VRAM address (15 bits).
@@ -132,9 +138,32 @@ pub struct Ppu {
     /// Object attribute memory (64 sprites × 4 bytes).
     oam: [u8; 256],
 
+    // === Background pipeline. ===
+    nt_latch: u8,
+    at_latch: u8,
+    pattern_lo_latch: u8,
+    pattern_hi_latch: u8,
+    bg_shift_lo: u16,
+    bg_shift_hi: u16,
+    attr_shift_lo: u16,
+    attr_shift_hi: u16,
+
+    // === Sprite pipeline. ===
+    /// Sprites found by evaluation for the next scanline.
+    eval_sprites: [EvaluatedSprite; 8],
+    eval_count: usize,
+    /// Sprites (with fetched patterns) being drawn on the current scanline.
+    line_sprites: [LineSprite; 8],
+    line_sprite_count: usize,
+    /// Sprites fetched during dots 257–320, promoted to `line_sprites` at
+    /// the start of the next scanline.
+    next_line_sprites: [LineSprite; 8],
+
     // === Frame output. ===
-    /// 256×240 RGBA8 framebuffer.
-    framebuffer: Box<[u8; FRAMEBUFFER_BYTES]>,
+    /// Frame currently being drawn.
+    back_buffer: Box<[u8; FRAMEBUFFER_BYTES]>,
+    /// Last completed frame (what [`Ppu::framebuffer`] returns).
+    front_buffer: Box<[u8; FRAMEBUFFER_BYTES]>,
 
     // === Timing. ===
     /// Current dot within scanline (0..=340).
@@ -143,21 +172,14 @@ pub struct Ppu {
     scanline: u16,
     /// Number of frames rendered since power-on.
     frame_count: u64,
+    /// Toggles every frame; odd frames skip a dot when rendering.
+    odd_frame: bool,
 
     // === Interrupt line. ===
     /// Edge-detected NMI pulse waiting to be consumed by the CPU bus.
     nmi_pending: bool,
-    /// Snapshot of `nmi_output` from the previous tick; used to detect the
-    /// low→high edge that fires NMI.
+    /// Snapshot of the NMI output line; used to detect the rising edge.
     nmi_previous: bool,
-
-    // === Per-scanline sprite buffer. ===
-    /// Sprites selected for the *current* visible scanline (max 8).
-    sprite_buffer: [SpriteEntry; 8],
-    /// Number of valid entries in `sprite_buffer`.
-    sprite_count: usize,
-    /// True when sprite-0 was picked into `sprite_buffer` this scanline.
-    sprite_zero_in_line: bool,
 }
 
 impl Default for Ppu {
@@ -174,6 +196,7 @@ impl Ppu {
             mask: 0,
             status: 0,
             oam_addr: 0,
+            io_latch: 0,
             v: 0,
             t: 0,
             x: 0,
@@ -182,15 +205,27 @@ impl Ppu {
             vram: [0u8; 2048],
             palette_ram: [0u8; 32],
             oam: [0u8; 256],
-            framebuffer: Box::new([0u8; FRAMEBUFFER_BYTES]),
+            nt_latch: 0,
+            at_latch: 0,
+            pattern_lo_latch: 0,
+            pattern_hi_latch: 0,
+            bg_shift_lo: 0,
+            bg_shift_hi: 0,
+            attr_shift_lo: 0,
+            attr_shift_hi: 0,
+            eval_sprites: [EvaluatedSprite::default(); 8],
+            eval_count: 0,
+            line_sprites: [LineSprite::default(); 8],
+            line_sprite_count: 0,
+            next_line_sprites: [LineSprite::default(); 8],
+            back_buffer: Box::new([0u8; FRAMEBUFFER_BYTES]),
+            front_buffer: Box::new([0u8; FRAMEBUFFER_BYTES]),
             cycle: 0,
             scanline: 0,
             frame_count: 0,
+            odd_frame: false,
             nmi_pending: false,
             nmi_previous: false,
-            sprite_buffer: [SpriteEntry::default(); 8],
-            sprite_count: 0,
-            sprite_zero_in_line: false,
         }
     }
 
@@ -201,17 +236,21 @@ impl Ppu {
         self.ctrl = 0;
         self.mask = 0;
         self.w = false;
+        self.x = 0;
+        self.t = 0;
         self.data_buffer = 0;
         self.cycle = 0;
         self.scanline = 0;
+        self.odd_frame = false;
         self.nmi_pending = false;
         self.nmi_previous = false;
     }
 
-    /// Borrow the current framebuffer (RGBA8, row-major, top-to-bottom).
+    /// Borrow the most recently *completed* frame (RGBA8, row-major,
+    /// top-to-bottom).
     #[inline]
     pub fn framebuffer(&self) -> &[u8; FRAMEBUFFER_BYTES] {
-        &self.framebuffer
+        &self.front_buffer
     }
 
     /// Number of completed frames since power-on.
@@ -246,26 +285,35 @@ impl Ppu {
     /// Read a memory-mapped PPU register. `addr` may be any value in
     /// `$2000-$3FFF`; the low 3 bits select the register.
     pub fn read_register(&mut self, addr: u16, mapper: &mut dyn Mapper) -> u8 {
-        match addr & 0x7 {
+        let value = match addr & 0x7 {
             // $2002 PPUSTATUS — clears vblank and the write toggle on read.
+            // The low five bits are not driven and read back as open bus.
             2 => {
-                let value = self.status;
+                let value = (self.status & 0xE0) | (self.io_latch & 0x1F);
                 self.status &= !status_bits::VBLANK;
                 self.w = false;
-                // Re-evaluate NMI output line edge so a CPU read of PPUSTATUS
-                // that races vblank does not retrigger a queued NMI.
                 self.refresh_nmi_edge();
                 value
             }
             // $2004 OAMDATA — direct OAM read, does not increment OAMADDR.
-            4 => self.oam[self.oam_addr as usize],
+            // Bits 2-4 of attribute bytes do not exist and read back as 0.
+            4 => {
+                let v = self.oam[self.oam_addr as usize];
+                if self.oam_addr & 0x03 == 0x02 {
+                    v & 0xE3
+                } else {
+                    v
+                }
+            }
             // $2007 PPUDATA — buffered read except for palette range.
             7 => {
                 let v_before = self.v & 0x3FFF;
                 let value = if v_before >= 0x3F00 {
-                    // Palette reads return the value immediately; the buffer
-                    // is still refreshed from the underlying nametable mirror.
-                    let palette_byte = self.read_palette(v_before);
+                    // Palette reads return the value immediately (upper two
+                    // bits are open bus); the buffer is refreshed from the
+                    // nametable "underneath" the palette.
+                    let palette_byte =
+                        (self.read_palette(v_before) & 0x3F) | (self.io_latch & 0xC0);
                     self.data_buffer = self.read_vram_byte(v_before - 0x1000, mapper);
                     palette_byte
                 } else {
@@ -273,17 +321,19 @@ impl Ppu {
                     self.data_buffer = self.read_vram_byte(v_before, mapper);
                     buffered
                 };
-                self.increment_v_after_data_access();
+                self.increment_v_after_data_access(mapper);
                 value
             }
-            // Write-only registers return open bus on real hardware; we
-            // return 0 to keep the model simple and deterministic.
-            _ => 0,
-        }
+            // Write-only registers return the open-bus latch.
+            _ => self.io_latch,
+        };
+        self.io_latch = value;
+        value
     }
 
     /// Write a memory-mapped PPU register.
     pub fn write_register(&mut self, addr: u16, value: u8, mapper: &mut dyn Mapper) {
+        self.io_latch = value;
         match addr & 0x7 {
             // $2000 PPUCTRL.
             0 => {
@@ -291,7 +341,7 @@ impl Ppu {
                 // t: ....BA.. ........ = d: ......BA
                 self.t = (self.t & 0xF3FF) | ((u16::from(value) & 0x03) << 10);
                 // Setting NMI_ENABLE while vblank is currently asserted
-                // triggers a delayed NMI on the next CPU cycle.
+                // triggers an NMI.
                 self.refresh_nmi_edge();
             }
             // $2001 PPUMASK.
@@ -325,20 +375,20 @@ impl Ppu {
                 if !self.w {
                     // t: ..FEDCBA ........ = d: ..FEDCBA;  t: X....... = 0
                     self.t = (self.t & 0x00FF) | ((u16::from(value) & 0x3F) << 8);
-                    self.t &= 0x3FFF;
                     self.w = true;
                 } else {
                     // t: ........ HGFEDCBA = d: HGFEDCBA;  v = t
                     self.t = (self.t & 0xFF00) | u16::from(value);
                     self.v = self.t;
                     self.w = false;
+                    mapper.ppu_address_changed(self.v & 0x3FFF);
                 }
             }
             // $2007 PPUDATA.
             7 => {
                 let addr = self.v & 0x3FFF;
                 self.write_vram_byte(addr, value, mapper);
-                self.increment_v_after_data_access();
+                self.increment_v_after_data_access(mapper);
             }
             _ => unreachable!(),
         }
@@ -353,10 +403,9 @@ impl Ppu {
         }
     }
 
-    /// Advance the PPU by `cpu_cycles * 3` PPU dots, performing per-scanline
-    /// rendering and updating timing flags along the way.
+    /// Advance the PPU by `cpu_cycles` CPU cycles (three PPU dots each on
+    /// NTSC silicon), rendering pixels and updating timing flags as it goes.
     pub fn step(&mut self, cpu_cycles: u32, mapper: &mut dyn Mapper) {
-        // The PPU runs 3 dots for every CPU cycle on NTSC silicon.
         let ppu_cycles = cpu_cycles.saturating_mul(3);
         for _ in 0..ppu_cycles {
             self.tick_one(mapper);
@@ -368,41 +417,121 @@ impl Ppu {
     // -----------------------------------------------------------------------
 
     fn tick_one(&mut self, mapper: &mut dyn Mapper) {
-        // (scanline, cycle) timing events.
-        // - Pre-render (261) dot 1: clear vblank/sprite-0-hit/overflow.
-        // - VBlank (241) dot 1: set vblank flag.
-        // - Visible (0..=239) dot 256: render scanline + evaluate next sprites.
-        if self.scanline == PRE_RENDER_SCANLINE && self.cycle == 1 {
+        let scanline = self.scanline;
+        let dot = self.cycle;
+        let visible_line = scanline < SCREEN_HEIGHT as u16;
+        let pre_render = scanline == PRE_RENDER_SCANLINE;
+        let rendering = self.rendering_enabled();
+
+        if pre_render && dot == 1 {
             self.status &= !(status_bits::VBLANK
                 | status_bits::SPRITE_ZERO_HIT
                 | status_bits::SPRITE_OVERFLOW);
             self.refresh_nmi_edge();
         }
-        if self.scanline == VBLANK_START_SCANLINE && self.cycle == 1 {
+        if scanline == VBLANK_START_SCANLINE && dot == 1 {
             self.status |= status_bits::VBLANK;
             self.refresh_nmi_edge();
+            // The visible picture is complete: publish it.
+            std::mem::swap(&mut self.front_buffer, &mut self.back_buffer);
         }
-        if self.scanline < SCREEN_HEIGHT as u16 && self.cycle == 256 {
-            // Render this scanline using current scroll state, then evaluate
-            // the sprite list for the *next* scanline so it is in place when
-            // we render it.
-            if self.rendering_enabled() {
-                self.render_scanline(mapper);
-            }
-            // Sprite evaluation runs whether or not background is enabled,
-            // but it is only meaningful for sprite-0 hit if rendering is on.
-            self.evaluate_sprites_for_next_scanline();
+
+        // The fetch pipeline runs first so the pixel for this dot is taken
+        // from the shift registers *after* this dot's shift.
+        if rendering && (visible_line || pre_render) {
+            self.run_fetch_pipeline(dot, pre_render, mapper);
+        }
+
+        if visible_line && (1..=256).contains(&dot) {
+            self.output_pixel(dot - 1);
         }
 
         // Advance the dot/scanline/frame counters.
         self.cycle += 1;
+        // Odd frames are one dot shorter when rendering is enabled: the
+        // pre-render line's last dot is skipped.
+        if pre_render && self.cycle == 340 && self.odd_frame && rendering {
+            self.cycle = DOTS_PER_SCANLINE;
+        }
         if self.cycle >= DOTS_PER_SCANLINE {
             self.cycle = 0;
             self.scanline += 1;
+            if self.scanline < SCREEN_HEIGHT as u16 {
+                self.start_scanline_sprites();
+            }
             if self.scanline >= SCANLINES_PER_FRAME {
                 self.scanline = 0;
                 self.frame_count = self.frame_count.wrapping_add(1);
+                self.odd_frame = !self.odd_frame;
+                self.start_scanline_sprites();
             }
+        }
+    }
+
+    /// Background + sprite memory fetches and loopy-register updates for one
+    /// dot of a rendering scanline (visible or pre-render).
+    fn run_fetch_pipeline(&mut self, dot: u16, pre_render: bool, mapper: &mut dyn Mapper) {
+        // Background fetches: dots 1-256 for the current line and 321-336
+        // for the first two tiles of the next line.
+        if (2..=257).contains(&dot) || (322..=337).contains(&dot) {
+            self.shift_background();
+        }
+        if (1..=256).contains(&dot) || (321..=336).contains(&dot) {
+            match dot & 0x07 {
+                1 => {
+                    self.reload_background_shifters();
+                    self.nt_latch = self.read_nametable(0x2000 | (self.v & 0x0FFF), mapper);
+                }
+                3 => {
+                    let v = self.v;
+                    let at_addr = 0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
+                    let at = self.read_nametable(at_addr, mapper);
+                    let shift = ((v >> 4) & 0x04) | (v & 0x02);
+                    self.at_latch = (at >> shift) & 0x03;
+                }
+                5 => {
+                    let addr = self.bg_pattern_addr();
+                    self.pattern_lo_latch = mapper.ppu_read(addr);
+                }
+                7 => {
+                    let addr = self.bg_pattern_addr() + 8;
+                    self.pattern_hi_latch = mapper.ppu_read(addr);
+                }
+                0 => self.increment_coarse_x(),
+                _ => {}
+            }
+        }
+        if dot == 256 {
+            self.increment_y();
+        }
+        if dot == 257 {
+            self.reload_background_shifters();
+            // Horizontal bits of t → v.
+            self.v = (self.v & !0x041F) | (self.t & 0x041F);
+            if pre_render {
+                self.eval_count = 0;
+            } else {
+                self.evaluate_sprites();
+            }
+        }
+        if pre_render && (280..=304).contains(&dot) {
+            // Vertical bits of t → v.
+            self.v = (self.v & !0x7BE0) | (self.t & 0x7BE0);
+        }
+        // Sprite pattern fetches: 8 slots of 8 dots across 257-320. The
+        // pattern bytes are read on the 5th and 7th dot of each slot.
+        if (257..=320).contains(&dot) {
+            let slot = ((dot - 257) / 8) as usize;
+            match (dot - 257) % 8 {
+                4 => self.fetch_sprite_pattern(slot, false, mapper),
+                6 => self.fetch_sprite_pattern(slot, true, mapper),
+                _ => {}
+            }
+        }
+        // Unused nametable fetches at the end of the line (MMC5 and some
+        // A12 watchers care).
+        if dot == 337 || dot == 339 {
+            let _ = self.read_nametable(0x2000 | (self.v & 0x0FFF), mapper);
         }
     }
 
@@ -421,7 +550,7 @@ impl Ppu {
         self.mask & (mask::SHOW_BG | mask::SHOW_SPR) != 0
     }
 
-    /// `$2000` and `$2007` writes use the increment-mode bit of PPUCTRL.
+    /// `$2007` accesses use the increment-mode bit of PPUCTRL.
     #[inline]
     fn vram_increment(&self) -> u16 {
         if self.ctrl & ctrl::VRAM_INCREMENT != 0 {
@@ -431,8 +560,76 @@ impl Ppu {
         }
     }
 
-    fn increment_v_after_data_access(&mut self) {
-        self.v = self.v.wrapping_add(self.vram_increment()) & 0x3FFF;
+    fn increment_v_after_data_access(&mut self, mapper: &mut dyn Mapper) {
+        self.v = self.v.wrapping_add(self.vram_increment()) & 0x7FFF;
+        // Outside of rendering the PPU keeps `v` on its address bus.
+        mapper.ppu_address_changed(self.v & 0x3FFF);
+    }
+
+    // -----------------------------------------------------------------------
+    // Loopy register helpers.
+    // -----------------------------------------------------------------------
+
+    fn increment_coarse_x(&mut self) {
+        if self.v & 0x001F == 31 {
+            self.v &= !0x001F;
+            self.v ^= 0x0400; // switch horizontal nametable
+        } else {
+            self.v += 1;
+        }
+    }
+
+    fn increment_y(&mut self) {
+        if self.v & 0x7000 != 0x7000 {
+            self.v += 0x1000; // fine Y
+        } else {
+            self.v &= !0x7000;
+            let mut coarse_y = (self.v & 0x03E0) >> 5;
+            if coarse_y == 29 {
+                coarse_y = 0;
+                self.v ^= 0x0800; // switch vertical nametable
+            } else if coarse_y == 31 {
+                coarse_y = 0; // out-of-range rows wrap without switching
+            } else {
+                coarse_y += 1;
+            }
+            self.v = (self.v & !0x03E0) | (coarse_y << 5);
+        }
+    }
+
+    #[inline]
+    fn bg_pattern_addr(&self) -> u16 {
+        let base = if self.ctrl & ctrl::BG_PATTERN != 0 {
+            0x1000
+        } else {
+            0x0000
+        };
+        let fine_y = (self.v >> 12) & 0x07;
+        base + u16::from(self.nt_latch) * 16 + fine_y
+    }
+
+    fn shift_background(&mut self) {
+        self.bg_shift_lo <<= 1;
+        self.bg_shift_hi <<= 1;
+        self.attr_shift_lo <<= 1;
+        self.attr_shift_hi <<= 1;
+    }
+
+    fn reload_background_shifters(&mut self) {
+        self.bg_shift_lo = (self.bg_shift_lo & 0xFF00) | u16::from(self.pattern_lo_latch);
+        self.bg_shift_hi = (self.bg_shift_hi & 0xFF00) | u16::from(self.pattern_hi_latch);
+        let lo = if self.at_latch & 0x01 != 0 {
+            0xFF
+        } else {
+            0x00
+        };
+        let hi = if self.at_latch & 0x02 != 0 {
+            0xFF
+        } else {
+            0x00
+        };
+        self.attr_shift_lo = (self.attr_shift_lo & 0xFF00) | lo;
+        self.attr_shift_hi = (self.attr_shift_hi & 0xFF00) | hi;
     }
 
     // -----------------------------------------------------------------------
@@ -465,7 +662,7 @@ impl Ppu {
     }
 
     fn write_palette(&mut self, addr: u16, value: u8) {
-        self.palette_ram[Self::palette_index(addr)] = value;
+        self.palette_ram[Self::palette_index(addr)] = value & 0x3F;
     }
 
     fn read_vram_byte(&self, addr: u16, mapper: &mut dyn Mapper) -> u8 {
@@ -476,6 +673,14 @@ impl Ppu {
             0x3F00..=0x3FFF => self.read_palette(a),
             _ => unreachable!(),
         }
+    }
+
+    /// Read a nametable byte during rendering without notifying the mapper
+    /// of the address (keeps the per-dot fetch path cheap; no supported
+    /// mapper watches nametable fetches).
+    #[inline]
+    fn read_nametable(&self, addr: u16, mapper: &dyn Mapper) -> u8 {
+        self.vram[self.nametable_index(addr, mapper)]
     }
 
     fn write_vram_byte(&mut self, addr: u16, value: u8, mapper: &mut dyn Mapper) {
@@ -492,53 +697,11 @@ impl Ppu {
     }
 
     // -----------------------------------------------------------------------
-    // Sprite evaluation.
+    // Sprites.
     // -----------------------------------------------------------------------
 
-    /// Populate `sprite_buffer` with the sprites that intersect the *next*
-    /// scanline (the one we'll render on the next tick at dot 256).
-    fn evaluate_sprites_for_next_scanline(&mut self) {
-        self.sprite_count = 0;
-        self.sprite_zero_in_line = false;
-
-        // The scanline whose pixels we will write next.
-        let next_scanline = self.scanline.wrapping_add(1);
-        if next_scanline >= SCREEN_HEIGHT as u16 {
-            return;
-        }
-        let next_y = next_scanline as i32;
-        let sprite_height = self.sprite_height() as i32;
-
-        for i in 0..64 {
-            let base = i * 4;
-            let y = self.oam[base] as i32;
-            // Sprite occupies rows [y+1, y+1+sprite_height) on screen.
-            let row_top = y + 1;
-            let row_bot = row_top + sprite_height;
-            if next_y >= row_top && next_y < row_bot {
-                if self.sprite_count < 8 {
-                    self.sprite_buffer[self.sprite_count] = SpriteEntry {
-                        oam_index: i as u8,
-                        y: y as u8,
-                        tile: self.oam[base + 1],
-                        attr: self.oam[base + 2],
-                        x: self.oam[base + 3],
-                    };
-                    if i == 0 {
-                        self.sprite_zero_in_line = true;
-                    }
-                    self.sprite_count += 1;
-                } else {
-                    // 9th sprite encountered for this scanline.
-                    self.status |= status_bits::SPRITE_OVERFLOW;
-                    break;
-                }
-            }
-        }
-    }
-
     #[inline]
-    fn sprite_height(&self) -> u8 {
+    fn sprite_height(&self) -> u16 {
         if self.ctrl & ctrl::SPRITE_SIZE != 0 {
             16
         } else {
@@ -546,241 +709,192 @@ impl Ppu {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Rendering.
-    // -----------------------------------------------------------------------
-
-    /// Render the current visible scanline (`self.scanline`, 0..=239) into
-    /// the framebuffer.
-    fn render_scanline(&mut self, mapper: &mut dyn Mapper) {
-        let y = self.scanline as usize;
-        // Universal background color used when both BG and sprite pixels are
-        // transparent.
-        let universal_bg = self.read_palette(0x3F00) & 0x3F;
-
-        // Snapshot of the loopy registers at the start of the scanline.
-        let mut v_local = self.v;
-        let fine_x = self.x;
-
-        for x in 0..SCREEN_WIDTH {
-            // ----- Background pixel.
-            let (bg_pixel, bg_palette) = if self.mask & mask::SHOW_BG != 0
-                && (x >= 8 || self.mask & mask::SHOW_BG_LEFT8 != 0)
-            {
-                self.fetch_bg_pixel(v_local, fine_x, x, y, mapper)
-            } else {
-                (0u8, 0u8)
-            };
-
-            // ----- Sprite pixel.
-            let mut sprite_pixel = 0u8;
-            let mut sprite_palette = 0u8;
-            let mut sprite_is_zero = false;
-            let mut sprite_priority_front = false;
-            if self.mask & mask::SHOW_SPR != 0 && (x >= 8 || self.mask & mask::SHOW_SPR_LEFT8 != 0)
-            {
-                for i in 0..self.sprite_count {
-                    let s = self.sprite_buffer[i];
-                    let sx = s.x as usize;
-                    if x < sx || x >= sx + 8 {
-                        continue;
-                    }
-                    let col_in_sprite = (x - sx) as u8;
-                    let (p, pal, in_front) = self.fetch_sprite_pixel(&s, col_in_sprite, y, mapper);
-                    if p != 0 {
-                        sprite_pixel = p;
-                        sprite_palette = pal;
-                        sprite_priority_front = in_front;
-                        sprite_is_zero = self.sprite_zero_in_line && s.oam_index == 0;
-                        break;
-                    }
-                }
+    /// Select the (up to 8) sprites that intersect the *next* scanline. A
+    /// sprite with OAM Y coordinate `y` covers screen rows `y+1 ..= y+h`, so
+    /// evaluating against the current scanline number yields the sprites for
+    /// the following line.
+    fn evaluate_sprites(&mut self) {
+        self.eval_count = 0;
+        let line = self.scanline;
+        let height = self.sprite_height();
+        for i in 0..64 {
+            let base = i * 4;
+            let y = self.oam[base];
+            let row = line.wrapping_sub(u16::from(y));
+            if row >= height {
+                continue;
             }
-
-            // ----- Priority muxing.
-            let (palette_addr, _is_sprite) = match (bg_pixel, sprite_pixel) {
-                (0, 0) => (0x3F00u16, false),
-                (0, _) => (
-                    0x3F10 | (u16::from(sprite_palette) << 2) | u16::from(sprite_pixel),
-                    true,
-                ),
-                (_, 0) => (
-                    0x3F00 | (u16::from(bg_palette) << 2) | u16::from(bg_pixel),
-                    false,
-                ),
-                (_, _) => {
-                    // Sprite-zero hit: triggered only when both pixels are
-                    // non-transparent, rendering is enabled, the pixel is
-                    // not on the leftmost 8 columns when those are masked
-                    // for either layer, and x < 255.
-                    if sprite_is_zero && x != 255 {
-                        let left8_ok = x >= 8
-                            || (self.mask & mask::SHOW_BG_LEFT8 != 0
-                                && self.mask & mask::SHOW_SPR_LEFT8 != 0);
-                        if left8_ok {
-                            self.status |= status_bits::SPRITE_ZERO_HIT;
-                        }
-                    }
-                    if sprite_priority_front {
-                        (
-                            0x3F10 | (u16::from(sprite_palette) << 2) | u16::from(sprite_pixel),
-                            true,
-                        )
-                    } else {
-                        (
-                            0x3F00 | (u16::from(bg_palette) << 2) | u16::from(bg_pixel),
-                            false,
-                        )
-                    }
-                }
+            if self.eval_count == 8 {
+                self.status |= status_bits::SPRITE_OVERFLOW;
+                break;
+            }
+            self.eval_sprites[self.eval_count] = EvaluatedSprite {
+                y,
+                tile: self.oam[base + 1],
+                attr: self.oam[base + 2],
+                x: self.oam[base + 3],
+                is_zero: i == 0,
             };
-
-            let color_index = self.read_palette(palette_addr) & 0x3F;
-            // Optimisation: fall back to the universal bg color if rendering
-            // is disabled (caller already early-returns in that case so this
-            // is mostly defensive).
-            let color = palette::NES_PALETTE[if self.rendering_enabled() {
-                color_index
-            } else {
-                universal_bg
-            } as usize];
-
-            let off = (y * SCREEN_WIDTH + x) * 4;
-            self.framebuffer[off] = color[0];
-            self.framebuffer[off + 1] = color[1];
-            self.framebuffer[off + 2] = color[2];
-            self.framebuffer[off + 3] = 0xFF;
-
-            // Advance the per-pixel "coarse X carry" used by background tile
-            // selection. This is a simplification: the real PPU increments
-            // coarse X once per 8 dots after a fine-X-aligned start, with a
-            // nametable bit toggled on each wraparound. Our `fetch_bg_pixel`
-            // recomputes those addresses from v_local + fine_x + pixel_x on
-            // each call so we don't need to mutate v_local here.
-            let _ = &mut v_local;
+            self.eval_count += 1;
         }
     }
 
-    /// Compute the 2-bit background pattern pixel and 2-bit palette index for
-    /// the screen column `screen_x` on the current scanline, starting from
-    /// the loopy `v` and `fine_x` values latched at the beginning of the
-    /// scanline. This implements the same address math the real PPU performs,
-    /// but in a per-pixel form for simplicity.
-    fn fetch_bg_pixel(
-        &self,
-        v_at_line_start: u16,
-        fine_x: u8,
-        screen_x: usize,
-        screen_y: usize,
-        mapper: &mut dyn Mapper,
-    ) -> (u8, u8) {
-        // Vertical position is taken directly from the scanline number plus
-        // the coarse-Y / fine-Y components latched into v at the start of
-        // the frame (the real PPU advances v's vertical bits at the end of
-        // each scanline; we approximate by deriving them from `screen_y`).
-        let v = v_at_line_start;
-        let coarse_x = (v & 0x001F) as u32;
-        let coarse_y_start = ((v >> 5) & 0x001F) as u32;
-        let nt_select = ((v >> 10) & 0x0003) as u32;
-        let fine_y_start = ((v >> 12) & 0x0007) as u32;
-
-        // Add screen_y rows to the starting vertical position.
-        let absolute_y = coarse_y_start * 8 + fine_y_start + screen_y as u32;
-        let coarse_y = (absolute_y / 8) & 0x1F;
-        let fine_y = absolute_y % 8;
-        let v_wraps = absolute_y / (30 * 8); // 30 rows per nametable
-
-        let absolute_x = coarse_x * 8 + u32::from(fine_x) + screen_x as u32;
-        let tile_col = (absolute_x / 8) & 0x1F;
-        let pixel_col = (absolute_x % 8) as u8;
-        let h_wraps = absolute_x / (32 * 8);
-        let nt_h = (nt_select ^ h_wraps) & 1;
-        let nt_v = ((nt_select >> 1) ^ v_wraps) & 1;
-
-        let nametable_base = 0x2000 | (nt_v << 11) | (nt_h << 10);
-        let tile_addr = nametable_base | (coarse_y << 5) | tile_col;
-        let tile_index = self.vram[self.nametable_index(tile_addr as u16, mapper)];
-
-        // Attribute byte: each byte covers a 4×4 tile region (32×32 px).
-        let attr_addr =
-            0x23C0 | (nt_v << 11) | (nt_h << 10) | ((coarse_y / 4) << 3) | (tile_col / 4);
-        let attr_byte = self.vram[self.nametable_index(attr_addr as u16, mapper)];
-        let quadrant_shift = ((coarse_y & 0x02) << 1) | (tile_col & 0x02);
-        let palette = (attr_byte >> quadrant_shift) & 0x03;
-
-        // Pattern table lookup.
-        let pattern_base = if self.ctrl & ctrl::BG_PATTERN != 0 {
-            0x1000
+    /// Fetch one pattern plane for sprite slot `slot` (dots 257–320). Empty
+    /// slots still fetch tile `$FF`, as the hardware does, so mapper A12
+    /// watchers see a realistic address stream.
+    fn fetch_sprite_pattern(&mut self, slot: usize, high_plane: bool, mapper: &mut dyn Mapper) {
+        let height = self.sprite_height();
+        let (sprite, present) = if slot < self.eval_count {
+            (self.eval_sprites[slot], true)
         } else {
-            0x0000
+            (
+                EvaluatedSprite {
+                    y: 0xFF,
+                    tile: 0xFF,
+                    attr: 0xFF,
+                    x: 0xFF,
+                    is_zero: false,
+                },
+                false,
+            )
         };
-        let tile_addr = pattern_base + u16::from(tile_index) * 16 + fine_y as u16;
-        let lo = mapper.ppu_read(tile_addr);
-        let hi = mapper.ppu_read(tile_addr + 8);
-        let bit = 7 - pixel_col;
-        let p0 = (lo >> bit) & 1;
-        let p1 = (hi >> bit) & 1;
-        let pixel = (p1 << 1) | p0;
-        (pixel, palette)
+        let mut row = if present {
+            self.scanline.wrapping_sub(u16::from(sprite.y)) & (height - 1)
+        } else {
+            0
+        };
+        if present && sprite.attr & 0x80 != 0 {
+            row = height - 1 - row; // vertical flip
+        }
+        let addr = if height == 16 {
+            let table = if sprite.tile & 0x01 != 0 {
+                0x1000
+            } else {
+                0x0000
+            };
+            let tile = u16::from(sprite.tile & 0xFE) + u16::from(row >= 8);
+            table + tile * 16 + (row & 0x07)
+        } else {
+            let table = if self.ctrl & ctrl::SPRITE_PATTERN != 0 {
+                0x1000
+            } else {
+                0x0000
+            };
+            table + u16::from(sprite.tile) * 16 + row
+        };
+        let byte = mapper.ppu_read(if high_plane { addr + 8 } else { addr });
+        if !present {
+            return;
+        }
+        let byte = if sprite.attr & 0x40 != 0 {
+            byte.reverse_bits() // horizontal flip
+        } else {
+            byte
+        };
+        let entry = &mut self.next_line_sprites[slot];
+        entry.x = sprite.x;
+        entry.attr = sprite.attr;
+        entry.is_zero = sprite.is_zero;
+        if high_plane {
+            entry.hi = byte;
+        } else {
+            entry.lo = byte;
+        }
     }
 
-    /// Compute the 2-bit sprite pattern pixel and 2-bit palette index for
-    /// the given column inside the sprite. Returns `(pixel, palette, in_front)`.
-    fn fetch_sprite_pixel(
-        &self,
-        sprite: &SpriteEntry,
-        col_in_sprite: u8,
-        y: usize,
-        mapper: &mut dyn Mapper,
-    ) -> (u8, u8, bool) {
-        let row_in_sprite = (y as i32 - sprite.y as i32 - 1) as u8;
-        let flip_h = sprite.attr & 0x40 != 0;
-        let flip_v = sprite.attr & 0x80 != 0;
-        let palette = sprite.attr & 0x03;
-        let in_front = sprite.attr & 0x20 == 0;
-
-        let height = self.sprite_height();
-        let (pattern_base, tile_index, fine_y) = if height == 8 {
-            let sel_base = if self.ctrl & ctrl::SPRITE_PATTERN != 0 {
-                0x1000
-            } else {
-                0x0000
-            };
-            let fy = if flip_v {
-                7 - row_in_sprite
-            } else {
-                row_in_sprite
-            };
-            (sel_base, sprite.tile, fy)
+    /// Promote the sprites fetched during the previous line to the line about
+    /// to be drawn.
+    fn start_scanline_sprites(&mut self) {
+        if self.rendering_enabled() && self.scanline != 0 {
+            self.line_sprites = self.next_line_sprites;
+            self.line_sprite_count = self.eval_count;
         } else {
-            // 8×16 sprite: bit 0 of tile selects the pattern table.
-            let base = if sprite.tile & 0x01 != 0 {
-                0x1000
-            } else {
-                0x0000
-            };
-            let mut row = row_in_sprite;
-            if flip_v {
-                row = 15 - row;
+            // Sprites never appear on scanline 0 (no evaluation happens on
+            // the pre-render line), nor when rendering is off.
+            self.line_sprite_count = 0;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pixel output.
+    // -----------------------------------------------------------------------
+
+    fn output_pixel(&mut self, x: u16) {
+        let xi = x as usize;
+        let show_bg =
+            self.mask & mask::SHOW_BG != 0 && (xi >= 8 || self.mask & mask::SHOW_BG_LEFT8 != 0);
+        let show_spr =
+            self.mask & mask::SHOW_SPR != 0 && (xi >= 8 || self.mask & mask::SHOW_SPR_LEFT8 != 0);
+
+        // ----- Background pixel from the shift registers.
+        let (bg_pixel, bg_palette) = if show_bg {
+            let bit = 15 - u16::from(self.x);
+            let p0 = ((self.bg_shift_lo >> bit) & 1) as u8;
+            let p1 = ((self.bg_shift_hi >> bit) & 1) as u8;
+            let a0 = ((self.attr_shift_lo >> bit) & 1) as u8;
+            let a1 = ((self.attr_shift_hi >> bit) & 1) as u8;
+            ((p1 << 1) | p0, (a1 << 1) | a0)
+        } else {
+            (0, 0)
+        };
+
+        // ----- Sprite pixel: first opaque sprite in OAM order wins.
+        let mut spr_pixel = 0u8;
+        let mut spr_palette = 0u8;
+        let mut spr_front = false;
+        let mut spr_zero = false;
+        if show_spr {
+            for s in &self.line_sprites[..self.line_sprite_count] {
+                let offset = x.wrapping_sub(u16::from(s.x));
+                if offset >= 8 {
+                    continue;
+                }
+                let bit = 7 - offset;
+                let p = (((s.hi >> bit) & 1) << 1) | ((s.lo >> bit) & 1);
+                if p != 0 {
+                    spr_pixel = p;
+                    spr_palette = s.attr & 0x03;
+                    spr_front = s.attr & 0x20 == 0;
+                    spr_zero = s.is_zero;
+                    break;
+                }
             }
-            // Top tile uses (tile & 0xFE); bottom tile is (tile & 0xFE) | 1.
-            let tile = (sprite.tile & 0xFE) | u8::from(row >= 8);
-            let fy = row & 0x07;
-            (base, tile, fy)
+        }
+
+        // ----- Sprite-zero hit: both opaque, not at x=255. The left-8
+        // clipping is already folded into `show_bg`/`show_spr`.
+        if spr_zero && bg_pixel != 0 && spr_pixel != 0 && xi != 255 {
+            self.status |= status_bits::SPRITE_ZERO_HIT;
+        }
+
+        // ----- Priority multiplexer.
+        let palette_addr = match (bg_pixel, spr_pixel) {
+            (0, 0) => 0x3F00,
+            (0, _) => 0x3F10 | (u16::from(spr_palette) << 2) | u16::from(spr_pixel),
+            (_, 0) => 0x3F00 | (u16::from(bg_palette) << 2) | u16::from(bg_pixel),
+            _ if spr_front => 0x3F10 | (u16::from(spr_palette) << 2) | u16::from(spr_pixel),
+            _ => 0x3F00 | (u16::from(bg_palette) << 2) | u16::from(bg_pixel),
         };
 
-        let addr = pattern_base + u16::from(tile_index) * 16 + u16::from(fine_y);
-        let lo = mapper.ppu_read(addr);
-        let hi = mapper.ppu_read(addr + 8);
-        let bit = if flip_h {
-            col_in_sprite
+        // With rendering disabled the PPU outputs the backdrop colour —
+        // or, if `v` points into palette RAM, that palette entry (the
+        // "background palette hack" some demos use).
+        let palette_addr = if !self.rendering_enabled() && self.v & 0x3F00 == 0x3F00 {
+            self.v
         } else {
-            7 - col_in_sprite
+            palette_addr
         };
-        let p0 = (lo >> bit) & 1;
-        let p1 = (hi >> bit) & 1;
-        let pixel = (p1 << 1) | p0;
-        (pixel, palette, in_front)
+        let mut color_index = self.read_palette(palette_addr) & 0x3F;
+        if self.mask & mask::GRAYSCALE != 0 {
+            color_index &= 0x30;
+        }
+        let color = palette::NES_PALETTE[color_index as usize];
+        let off = (self.scanline as usize * SCREEN_WIDTH + xi) * 4;
+        let px = &mut self.back_buffer[off..off + 4];
+        px[0] = color[0];
+        px[1] = color[1];
+        px[2] = color[2];
+        px[3] = 0xFF;
     }
 
     // -----------------------------------------------------------------------
@@ -822,21 +936,6 @@ impl Ppu {
     pub fn debug_oam_mut(&mut self) -> &mut [u8; 256] {
         &mut self.oam
     }
-}
-
-// Silence the unused-import warnings for ctrl/mask bits the renderer does not
-// currently consult (grayscale/emphasis are out of scope for this milestone).
-#[allow(dead_code)]
-fn _suppress_unused() {
-    let _ = (
-        ctrl::NAMETABLE_LO,
-        ctrl::NAMETABLE_HI,
-        ctrl::_MASTER_SLAVE,
-        mask::_GRAYSCALE,
-        mask::_EMPHASIZE_R,
-        mask::_EMPHASIZE_G,
-        mask::_EMPHASIZE_B,
-    );
 }
 
 // Re-export the bits that are part of the public API surface so callers

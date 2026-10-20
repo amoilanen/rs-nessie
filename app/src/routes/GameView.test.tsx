@@ -31,6 +31,7 @@ const SAMPLE_INFO: SessionInfo = {
   sha1: 'a'.repeat(40),
   has_battery: false,
   mapper: 0,
+  session_id: 1,
 };
 
 function renderAt(path: string): ReturnType<typeof render> {

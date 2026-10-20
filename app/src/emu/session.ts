@@ -2,7 +2,8 @@
 //
 // Bundles together the three moving pieces a running emulator needs:
 //   1. A [`FrameRenderer`] that uploads each frame's pixels into a WebGL2
-//      texture and re-draws the active viewport.
+//      texture and re-draws the active viewport (at most once per display
+//      refresh, at the size last passed to `resize`).
 //   2. An [`InputController`] that listens for keyboard events and forwards
 //      `setButtonState` IPC calls.
 //   3. A Tauri `Channel` that streams the framebuffer payload emitted by the
@@ -26,7 +27,13 @@ import type {
 } from '../ipc/types';
 import type { PlayerBindings } from '../store/settingsStore';
 
-import { FrameRenderer, FRAME_BYTES, type AspectMode } from './frameRenderer';
+import {
+  FrameRenderer,
+  FRAME_BYTES,
+  NES_HEIGHT,
+  NES_WIDTH,
+  type AspectMode,
+} from './frameRenderer';
 import { InputController, type SetButtonStateFn } from './inputController';
 
 /** Handle returned by [`mountGameSession`] — controls a live session. */
@@ -58,6 +65,20 @@ export interface MountGameSessionArgs {
   attachTarget?: EventTarget;
   /** Override for the `setButtonState` IPC call (tests). */
   send?: SetButtonStateFn;
+  /**
+   * Scheduler used to coalesce redraws (defaults to
+   * `requestAnimationFrame`). Tests pass a synchronous scheduler.
+   */
+  scheduleFrame?: (callback: () => void) => void;
+}
+
+/** Default redraw scheduler: the next display refresh. */
+function defaultScheduleFrame(callback: () => void): void {
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() => callback());
+  } else {
+    setTimeout(callback, 0);
+  }
 }
 
 /**
@@ -97,6 +118,25 @@ export async function mountGameSession(
 ): Promise<GameSession> {
   const renderer = new FrameRenderer(args.canvas);
   const input = new InputController(args.bindings, args.send);
+  const scheduleFrame = args.scheduleFrame ?? defaultScheduleFrame;
+
+  let stopped = false;
+  // Last known drawing-buffer size; updated by `resize`. Every received
+  // frame is presented at this size.
+  let viewportW = args.canvas.width || NES_WIDTH;
+  let viewportH = args.canvas.height || NES_HEIGHT;
+  // Frames can arrive faster than the display refreshes (or in bursts after
+  // a hiccup); uploading is cheap, so upload every frame but draw at most
+  // once per display refresh.
+  let drawPending = false;
+  const requestDraw = (): void => {
+    if (drawPending) return;
+    drawPending = true;
+    scheduleFrame(() => {
+      drawPending = false;
+      if (!stopped) renderer.draw(viewportW, viewportH);
+    });
+  };
 
   // The channel is `unknown` on the wire because the Rust host sends raw
   // byte payloads; the typed `FrameMessage` shape is reconstructed locally
@@ -104,9 +144,11 @@ export async function mountGameSession(
   // declares `Channel<FrameMessage>` for ergonomic call-site typing.
   const channel = new Channel<unknown>();
   channel.onmessage = (data: unknown): void => {
+    if (stopped) return;
     const frame = decodeFrame(data);
     if (!frame) return;
     renderer.upload(frame.pixels);
+    requestDraw();
   };
 
   let info: SessionInfo;
@@ -118,19 +160,21 @@ export async function mountGameSession(
   } catch (err) {
     // Release GPU resources before re-throwing so the renderer does not
     // leak when the host refuses to start a session.
+    stopped = true;
     renderer.dispose();
     throw err;
   }
 
   input.attach(args.attachTarget ?? window);
 
-  let stopped = false;
   const stop = async (): Promise<void> => {
     if (stopped) return;
     stopped = true;
     input.detach();
     try {
-      await ipcStopSession();
+      // Address the session by id: if a newer view already started its own
+      // session, this (late) stop must not tear that one down.
+      await ipcStopSession(info.session_id);
     } catch (err) {
       // Stopping the host session must always succeed locally even if the
       // IPC call failed — we still want to release GPU resources. The
@@ -143,7 +187,11 @@ export async function mountGameSession(
   return {
     info,
     stop,
-    resize: (w, h) => renderer.draw(w, h),
+    resize: (w, h) => {
+      viewportW = w;
+      viewportH = h;
+      if (!stopped) renderer.draw(w, h);
+    },
     setAspectMode: (mode) => renderer.setAspectMode(mode),
     setBindings: (bindings) => input.updateBindings(bindings),
   };

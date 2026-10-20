@@ -5,7 +5,8 @@
 //!
 //! 1. The SHA-1 of the final framebuffer matches a committed expected hex
 //!    digest. The fixture deliberately never enables PPU rendering, so the
-//!    framebuffer remains all-zero across all platforms; this gives the
+//!    PPU outputs the backdrop colour (palette entry `$3F00`, still `$00` =
+//!    grey at power-on) for every pixel on all platforms; this gives the
 //!    test a stable hash that does not depend on the host operating system,
 //!    CPU architecture, or Rust release.
 //! 2. The APU produced non-zero audio samples while the ROM ran. The
@@ -19,10 +20,10 @@ use sha1::{Digest, Sha1};
 
 const SMOKE_ROM: &[u8] = include_bytes!("fixtures/smoke.nes");
 
-/// SHA-1 of `[0u8; 256 * 240 * 4]` — i.e. an entirely black RGBA framebuffer.
-/// The smoke ROM never enables rendering so the PPU framebuffer is exactly
-/// this value at the end of frame 120.
-const EXPECTED_FRAME_SHA1: &str = "64646545171a7f81dfcd027089d1f38a7f81b82b";
+/// SHA-1 of a 256×240 RGBA framebuffer filled with NES colour `$00`
+/// (`84, 84, 84, 255`). The smoke ROM never enables rendering, so the PPU
+/// shows the power-on backdrop colour on every pixel.
+const EXPECTED_FRAME_SHA1: &str = "737081037b395e1b2b2f525d9f37f33320c45a9f";
 
 fn sha1_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha1::new();

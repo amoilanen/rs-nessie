@@ -48,6 +48,8 @@ pub trait HostAudio: AudioSink {
     fn set_volume(&self, volume: f32);
     /// Mute or un-mute the output.
     fn set_muted(&self, muted: bool);
+    /// Drop any buffered-but-unplayed audio (called when emulation pauses).
+    fn flush(&self) {}
 }
 
 impl HostAudio for CpalAudio {
@@ -57,6 +59,27 @@ impl HostAudio for CpalAudio {
     fn set_muted(&self, muted: bool) {
         CpalAudio::set_muted(self, muted);
     }
+    fn flush(&self) {
+        CpalAudio::flush(self);
+    }
+}
+
+/// Audio sink used when no OS audio output is available (no device, or the
+/// device refused to open). Samples are discarded so the game still runs —
+/// silently — instead of failing to start.
+#[derive(Debug, Default)]
+pub struct NullAudio;
+
+impl AudioSink for NullAudio {
+    fn push_samples(&self, _samples: &[f32]) {}
+    fn sample_rate(&self) -> u32 {
+        APU_SAMPLE_RATE
+    }
+}
+
+impl HostAudio for NullAudio {
+    fn set_volume(&self, _volume: f32) {}
+    fn set_muted(&self, _muted: bool) {}
 }
 
 /// Identifies which physical player slot an input applies to.
@@ -106,6 +129,8 @@ pub struct EmulatorSession {
     /// Cartridge SHA-1 (kept for diagnostics; the `save_path` is what
     /// actually gets written).
     sha1: String,
+    /// Host-assigned identifier (see [`EmulatorSession::set_session_id`]).
+    session_id: u64,
 }
 
 impl std::fmt::Debug for EmulatorSession {
@@ -119,7 +144,9 @@ impl std::fmt::Debug for EmulatorSession {
 }
 
 impl EmulatorSession {
-    /// Start a session backed by a real cpal audio device.
+    /// Start a session backed by a real cpal audio device. If no audio
+    /// output can be opened the session still starts, silently, with a
+    /// [`NullAudio`] sink (the failure is logged).
     ///
     /// `rom_bytes` is the iNES blob to load. `saves_dir` is the directory
     /// `<config>/dev.rs-nessie/saves/` that will receive the `.srm` file on
@@ -138,7 +165,13 @@ impl EmulatorSession {
     where
         F: FrameSink + 'static,
     {
-        let audio: Arc<dyn HostAudio> = Arc::new(CpalAudio::new(APU_SAMPLE_RATE)?);
+        let audio: Arc<dyn HostAudio> = match CpalAudio::new(APU_SAMPLE_RATE) {
+            Ok(cpal) => Arc::new(cpal),
+            Err(err) => {
+                log::warn!("audio output unavailable, running without sound: {err:?}");
+                Arc::new(NullAudio)
+            }
+        };
         Self::start_with(rom_bytes, save_bytes, saves_dir, audio, frame_sink)
     }
 
@@ -206,6 +239,7 @@ impl EmulatorSession {
             save_path,
             stopped: false,
             sha1,
+            session_id: 0,
         })
     }
 
@@ -214,15 +248,22 @@ impl EmulatorSession {
         self.runtime.set_button(player.into(), button, pressed);
     }
 
-    /// Pause or resume the audio stream.
+    /// Pause or resume emulation.
     ///
-    /// Implemented as a mute toggle: the emulation thread keeps running
-    /// (so input remains responsive and the frame counter stays sane), but
-    /// audio output is silenced. A future iteration can wire a real
-    /// "freeze the emu thread" path; spec §6.1 deliberately keeps that out
-    /// of scope for the initial release.
+    /// While paused the emulation thread stops stepping frames, so the game
+    /// freezes and produces no audio; queued audio is flushed so playback
+    /// stops immediately. The user's mute setting is left untouched.
     pub fn set_paused(&self, paused: bool) {
-        self.audio.set_muted(paused);
+        self.runtime.set_paused(paused);
+        if paused {
+            self.audio.flush();
+        }
+    }
+
+    /// `true` while emulation is paused.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.runtime.is_paused()
     }
 
     /// Update the output volume (`0.0..=1.0`, clamped).
@@ -253,6 +294,18 @@ impl EmulatorSession {
             }
         }
         Ok(())
+    }
+
+    /// Identifier the host assigned to this session (`0` until set).
+    #[must_use]
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// Assign the host-side identifier the frontend uses to address this
+    /// session in `stop_session`.
+    pub fn set_session_id(&mut self, id: u64) {
+        self.session_id = id;
     }
 
     /// SHA-1 of the loaded cartridge (lowercase hex, 40 chars).
@@ -364,6 +417,7 @@ mod tests {
         samples: PlMutex<Vec<f32>>,
         volume: PlMutex<f32>,
         muted: PlMutex<bool>,
+        flushes: PlMutex<u32>,
     }
 
     impl MockAudio {
@@ -372,6 +426,7 @@ mod tests {
                 samples: PlMutex::new(Vec::new()),
                 volume: PlMutex::new(1.0),
                 muted: PlMutex::new(false),
+                flushes: PlMutex::new(0),
             }
         }
     }
@@ -392,6 +447,9 @@ mod tests {
         fn set_muted(&self, muted: bool) {
             *self.muted.lock() = muted;
         }
+        fn flush(&self) {
+            *self.flushes.lock() += 1;
+        }
     }
 
     /// Mock frame sink: counts submitted frames.
@@ -404,6 +462,10 @@ mod tests {
             Self {
                 count: AtomicUsize::new(0),
             }
+        }
+
+        fn count(&self) -> usize {
+            self.count.load(Ordering::Relaxed)
         }
     }
 
@@ -548,10 +610,51 @@ mod tests {
         session.set_muted(true);
         assert!(*mock.muted.lock());
 
+        session.stop().unwrap();
+    }
+
+    #[test]
+    fn pause_freezes_emulation_without_touching_mute() {
+        let dir = tempdir().unwrap();
+        let saves_dir = dir.path().join("saves");
+        let rom = nrom_rom(false);
+
+        let mock = Arc::new(MockAudio::new());
+        let audio: Arc<dyn HostAudio> = mock.clone();
+        let frames = Arc::new(MockFrames::new());
+        let mut session =
+            EmulatorSession::start_with(&rom, None, saves_dir, audio, frames.clone()).unwrap();
+
+        session.set_muted(true);
+        session.set_paused(true);
+        assert!(session.is_paused());
+        assert_eq!(*mock.flushes.lock(), 1, "pausing flushes queued audio");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let frozen = frames.count();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(frames.count(), frozen, "no frames while paused");
+
+        // Resuming must not override the user's mute choice.
         session.set_paused(false);
-        assert!(!*mock.muted.lock());
+        assert!(!session.is_paused());
+        assert!(
+            *mock.muted.lock(),
+            "resume must keep the user's mute setting"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(frames.count() > frozen, "frames resume after unpausing");
 
         session.stop().unwrap();
+    }
+
+    #[test]
+    fn null_audio_accepts_samples_and_reports_apu_rate() {
+        let null = NullAudio;
+        null.push_samples(&[0.5; 16]);
+        null.set_volume(0.3);
+        null.set_muted(true);
+        null.flush();
+        assert_eq!(null.sample_rate(), APU_SAMPLE_RATE);
     }
 
     #[test]

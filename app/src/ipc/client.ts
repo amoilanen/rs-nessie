@@ -137,9 +137,14 @@ export function startSession(
   return call<SessionInfo>('start_session', { rom, frames });
 }
 
-/** `stop_session()` — stop the current session (idempotent). */
-export function stopSession(): Promise<void> {
-  return call<void>('stop_session');
+/**
+ * `stop_session(session_id?)` — stop the current session (idempotent). With
+ * a `sessionId`, only that session is stopped; a stale id is a no-op.
+ */
+export function stopSession(sessionId?: number): Promise<void> {
+  return sessionId === undefined
+    ? call<void>('stop_session')
+    : call<void>('stop_session', { sessionId });
 }
 
 /** `set_button_state(player, button, pressed)` — forward an input edge. */

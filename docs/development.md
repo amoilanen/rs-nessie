@@ -148,9 +148,25 @@ cargo test -p nessie-core apu          # APU tests
 cargo test -p nessie-core cart         # iNES parser + mapper tests
 cargo test -p nessie-core --test nestest   # nestest.nes golden trace
 cargo test -p nessie-core --test smoke     # full-frame smoke ROM
+cargo test -p nessie-core --test game_nes15  # E2E: play the nes15 homebrew game
 cargo test -p nessie-runtime
 cargo test -p rs-nessie                # Tauri host crate (library/settings/commands)
 ```
+
+### ROM accuracy suite (opt-in)
+
+blargg's public CPU/PPU/APU/MMC3 test ROMs are fetched at a pinned commit
+(not vendored) and run through their `$6000` result protocol:
+
+```bash
+scripts/fetch-test-roms.sh             # → target/nes-test-roms
+cargo test -p nessie-core --release --test blargg -- --ignored --nocapture
+```
+
+The `MUST_PASS` list in
+[`./crates/nessie-core/tests/blargg.rs`](../crates/nessie-core/tests/blargg.rs)
+is the regression gate (CI runs it on Linux); `KNOWN_FAILURES` documents the
+remaining sub-instruction timing gaps.
 
 ### Benches
 

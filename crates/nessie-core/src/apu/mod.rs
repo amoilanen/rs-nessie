@@ -9,13 +9,9 @@
 //! - **Triangle**: linear counter, length counter, 32-step sequence.
 //! - **Noise**: 15-bit LFSR with mode-0 (bit 1) and mode-1 (bit 6) feedback,
 //!   envelope, length counter.
-//! - **DMC**: register decoding, sample address/length, output level,
-//!   IRQ flag and length counter. **CPU-bus sample fetch is stubbed**: the
-//!   DMC reports the configured initial output level and decrements its
-//!   byte counter at the configured rate, but does not actually read
-//!   samples from CPU memory. The IRQ flag is asserted when the sample
-//!   buffer empties in non-loop mode, which is what the FR-18 acceptance
-//!   bar requires; full sample playback is a follow-up.
+//! - **DMC**: delta-modulation sample playback with the one-byte sample
+//!   buffer, output shift register, loop / IRQ handling and CPU-memory DMA
+//!   fetches (see [`Apu::step_with_memory`]).
 //! - **Frame counter**: 4-step and 5-step modes; frame IRQ on the
 //!   4-step mode when not inhibited.
 //!
@@ -35,9 +31,11 @@
 //!
 //! ## Timing model
 //!
-//! The APU is clocked from the CPU. Pulse/noise/DMC channels advance their
-//! timers on every *APU* cycle (one APU cycle = two CPU cycles); the
-//! triangle channel advances on every CPU cycle. Frame-counter events are
+//! The APU is clocked from the CPU. Pulse channels advance their timers on
+//! every *APU* cycle (one APU cycle = two CPU cycles); the triangle, noise
+//! and DMC timers advance on every CPU cycle (their period tables are in
+//! CPU cycles). DMC sample bytes are fetched through
+//! [`Apu::step_with_memory`], which the NES bus wires to cartridge space. Frame-counter events are
 //! placed at the canonical NTSC offsets:
 //!
 //! | Step | 4-step (CPU cycles) | 5-step (CPU cycles) | Quarter | Half  |
@@ -63,6 +61,17 @@ pub const NES_CPU_HZ: u32 = 1_789_773;
 /// Default audio sample rate used when one isn't supplied to
 /// [`Apu::with_sample_rate`].
 pub const DEFAULT_SAMPLE_RATE: u32 = 44_100;
+
+/// Cut-off of the output DC-blocking high-pass filter (the NES's first
+/// analogue output stage sits at ~90 Hz).
+const HIGH_PASS_HZ: f32 = 90.0;
+
+/// Coefficient of a one-pole RC high-pass at `cutoff_hz`.
+fn high_pass_alpha(sample_rate: u32, cutoff_hz: f32) -> f32 {
+    let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff_hz);
+    let dt = 1.0 / sample_rate as f32;
+    rc / (rc + dt)
+}
 
 /// Length-counter load table. Indexed by the upper 5 bits of writes to
 /// `$4003`/`$4007`/`$400B`/`$400F`.
@@ -494,13 +503,13 @@ impl Noise {
 }
 
 // -----------------------------------------------------------------------
-// DMC channel (sample fetch stubbed; counters and IRQ are real).
+// DMC channel.
 // -----------------------------------------------------------------------
 
 pub(crate) struct Dmc {
-    enabled: bool,
     irq_enabled: bool,
     loop_flag: bool,
+    /// Output-unit period in CPU cycles.
     rate: u16,
     timer: u16,
     output_level: u8,
@@ -509,22 +518,30 @@ pub(crate) struct Dmc {
     current_address: u16,
     pub(crate) bytes_remaining: u16,
     pub(crate) irq_flag: bool,
+    /// One-byte sample buffer filled by the DMA reader.
+    sample_buffer: Option<u8>,
+    shift_register: u8,
+    bits_remaining: u8,
+    silence: bool,
 }
 
 impl Dmc {
     fn new() -> Self {
         Self {
-            enabled: false,
             irq_enabled: false,
             loop_flag: false,
             rate: DMC_RATES[0],
-            timer: 0,
+            timer: DMC_RATES[0] - 1,
             output_level: 0,
             sample_address: 0xC000,
             sample_length: 1,
             current_address: 0xC000,
             bytes_remaining: 0,
             irq_flag: false,
+            sample_buffer: None,
+            shift_register: 0,
+            bits_remaining: 8,
+            silence: true,
         }
     }
 
@@ -550,39 +567,75 @@ impl Dmc {
     }
 
     fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
         if !enabled {
             self.bytes_remaining = 0;
         } else if self.bytes_remaining == 0 {
-            self.current_address = self.sample_address;
-            self.bytes_remaining = self.sample_length;
+            self.restart();
         }
         // A write to $4015 always clears the DMC IRQ flag.
         self.irq_flag = false;
     }
 
-    fn clock_timer(&mut self) {
-        if self.timer == 0 {
-            self.timer = self.rate;
-            if self.bytes_remaining > 0 {
-                // Sample fetch is stubbed — pretend we consumed a byte
-                // without changing the output level.
-                self.current_address = self.current_address.wrapping_add(1);
-                if self.current_address == 0 {
-                    self.current_address = 0x8000;
-                }
-                self.bytes_remaining -= 1;
-                if self.bytes_remaining == 0 {
-                    if self.loop_flag {
-                        self.current_address = self.sample_address;
-                        self.bytes_remaining = self.sample_length;
-                    } else if self.irq_enabled {
-                        self.irq_flag = true;
-                    }
-                }
-            }
+    fn restart(&mut self) {
+        self.current_address = self.sample_address;
+        self.bytes_remaining = self.sample_length;
+    }
+
+    /// Address the memory reader must fetch next, if the sample buffer is
+    /// empty and bytes remain in the current sample.
+    fn dma_request(&self) -> Option<u16> {
+        if self.sample_buffer.is_none() && self.bytes_remaining > 0 {
+            Some(self.current_address)
         } else {
+            None
+        }
+    }
+
+    /// Deliver the byte fetched for [`Dmc::dma_request`].
+    fn dma_complete(&mut self, byte: u8) {
+        self.sample_buffer = Some(byte);
+        self.current_address = if self.current_address == 0xFFFF {
+            0x8000
+        } else {
+            self.current_address + 1
+        };
+        self.bytes_remaining = self.bytes_remaining.saturating_sub(1);
+        if self.bytes_remaining == 0 {
+            if self.loop_flag {
+                self.restart();
+            } else if self.irq_enabled {
+                self.irq_flag = true;
+            }
+        }
+    }
+
+    /// Clocked on every CPU cycle; the rate table is expressed in CPU cycles.
+    fn clock_timer(&mut self) {
+        if self.timer > 0 {
             self.timer -= 1;
+            return;
+        }
+        self.timer = self.rate.saturating_sub(1);
+        if !self.silence {
+            if self.shift_register & 1 != 0 {
+                if self.output_level <= 125 {
+                    self.output_level += 2;
+                }
+            } else if self.output_level >= 2 {
+                self.output_level -= 2;
+            }
+        }
+        self.shift_register >>= 1;
+        self.bits_remaining = self.bits_remaining.saturating_sub(1);
+        if self.bits_remaining == 0 {
+            self.bits_remaining = 8;
+            match self.sample_buffer.take() {
+                Some(b) => {
+                    self.shift_register = b;
+                    self.silence = false;
+                }
+                None => self.silence = true,
+            }
         }
     }
 
@@ -618,6 +671,11 @@ pub struct Apu {
     frame_irq_inhibit: bool,
     pub(crate) frame_irq: bool,
     frame_cycle: u32,
+    /// Mode written to `$4017`, applied once `frame_reset_delay` expires.
+    pending_frame_mode: Option<u8>,
+    /// Last value written to `$4017`; re-applied on a warm reset.
+    last_frame_counter_write: u8,
+    frame_reset_delay: u8,
 
     // Triangle clocks on every CPU cycle; pulse/noise/DMC on every other
     // CPU cycle (the "APU cycle"). This toggles to select APU cycles.
@@ -627,6 +685,13 @@ pub struct Apu {
     sample_rate: u32,
     sample_accumulator: u64,
     samples: Vec<f32>,
+    /// Box-filter accumulator over the CPU cycles of the current sample.
+    mix_sum: f32,
+    mix_count: u32,
+    /// One-pole DC-blocking high-pass filter state.
+    hp_alpha: f32,
+    hp_prev_in: f32,
+    hp_prev_out: f32,
 }
 
 impl Default for Apu {
@@ -654,10 +719,18 @@ impl Apu {
             frame_irq_inhibit: false,
             frame_irq: false,
             frame_cycle: 0,
+            pending_frame_mode: None,
+            last_frame_counter_write: 0,
+            frame_reset_delay: 0,
             apu_phase: false,
             sample_rate,
             sample_accumulator: 0,
             samples: Vec::new(),
+            mix_sum: 0.0,
+            mix_count: 0,
+            hp_alpha: high_pass_alpha(sample_rate, HIGH_PASS_HZ),
+            hp_prev_in: 0.0,
+            hp_prev_out: 0.0,
         }
     }
 
@@ -668,6 +741,20 @@ impl Apu {
         let mut next = Self::with_sample_rate(sample_rate);
         next.samples = std::mem::take(&mut self.samples);
         *self = next;
+    }
+
+    /// Warm reset (the console's RESET button): unlike [`Apu::reset`],
+    /// channel registers survive. `$4015` is cleared (silencing every
+    /// channel and its length counter) and the last `$4017` value is written
+    /// again, restarting the frame sequencer.
+    pub fn soft_reset(&mut self) {
+        self.write_register(0x4015, 0x00);
+        self.frame_irq = false;
+        let last = self.last_frame_counter_write;
+        self.write_register(0x4017, last);
+        // The reset sequence itself provides the write delay: the caller
+        // ticks the APU through the CPU's reset cycles.
+        self.apply_frame_counter_mode();
     }
 
     /// The configured host sample rate (Hz).
@@ -742,27 +829,44 @@ impl Apu {
                 self.dmc.set_enabled((value & 0x10) != 0);
             }
             0x4017 => {
-                self.frame_mode = (value >> 7) & 0x01;
+                self.last_frame_counter_write = value;
                 self.frame_irq_inhibit = (value & 0x40) != 0;
                 if self.frame_irq_inhibit {
                     self.frame_irq = false;
                 }
-                self.frame_cycle = 0;
-                // Mode 1 (5-step) issues an immediate half-frame clock.
-                if self.frame_mode == 1 {
-                    self.clock_quarter_frame();
-                    self.clock_half_frame();
-                }
+                // The new mode takes effect (and the sequencer restarts) 3
+                // CPU cycles after the write if it lands on an APU cycle,
+                // 4 cycles otherwise.
+                self.pending_frame_mode = Some((value >> 7) & 0x01);
+                self.frame_reset_delay = if self.apu_phase { 4 } else { 3 };
             }
             _ => {}
         }
     }
 
     /// Advance the APU by `cpu_cycles` 6502 clocks.
+    ///
+    /// DMC sample fetches are answered with `0` because no memory is
+    /// attached; the NES bus uses [`Apu::step_with_memory`] instead.
     pub fn step(&mut self, cpu_cycles: u32) {
+        let _ = self.step_with_memory(cpu_cycles, |_| 0);
+    }
+
+    /// Advance the APU by `cpu_cycles` 6502 clocks, servicing DMC sample
+    /// DMA through `read`. Returns the number of CPU stall cycles the DMA
+    /// fetches cost (4 per fetched byte), which the caller must add to the
+    /// running instruction's cycle count.
+    pub fn step_with_memory<F: FnMut(u16) -> u8>(&mut self, cpu_cycles: u32, mut read: F) -> u32 {
+        let mut stall = 0;
         for _ in 0..cpu_cycles {
             self.tick_one_cpu_cycle();
+            if let Some(addr) = self.dmc.dma_request() {
+                let byte = read(addr);
+                self.dmc.dma_complete(byte);
+                stall += 4;
+            }
         }
+        stall
     }
 
     /// Move accumulated mono samples into `out`, leaving `self`'s sample
@@ -779,30 +883,63 @@ impl Apu {
     // ----- internal helpers ------------------------------------------------
 
     fn tick_one_cpu_cycle(&mut self) {
-        // Triangle clocks every CPU cycle.
+        // Triangle, noise and DMC timers count CPU cycles (their period
+        // tables are expressed in CPU cycles).
         self.triangle.clock_timer();
+        self.noise.clock_timer();
+        self.dmc.clock_timer();
 
-        // Pulse / noise / DMC clock every other CPU cycle (APU cycle).
+        // Pulse timers clock every other CPU cycle (APU cycle).
         if self.apu_phase {
             self.pulse1.clock_timer();
             self.pulse2.clock_timer();
-            self.noise.clock_timer();
-            self.dmc.clock_timer();
         }
         self.apu_phase = !self.apu_phase;
 
         // Frame counter.
         self.frame_cycle += 1;
         self.advance_frame_counter();
+        if self.pending_frame_mode.is_some() {
+            self.frame_reset_delay = self.frame_reset_delay.saturating_sub(1);
+            if self.frame_reset_delay == 0 {
+                self.apply_frame_counter_mode();
+            }
+        }
 
         // Sample accumulator. Emit a sample whenever the fractional
         // accumulator crosses the CPU clock; this yields exactly
         // floor(cycles * sample_rate / cpu_hz) samples per `step` call.
+        //
+        // Every CPU cycle's mixer output is accumulated and averaged into
+        // the emitted sample (a box filter) so ultrasonic content does not
+        // alias into the audible band, then a one-pole high-pass removes the
+        // mixer's DC offset (like the NES's own output coupling capacitor).
+        self.mix_sum += self.mix_sample();
+        self.mix_count += 1;
         self.sample_accumulator += u64::from(self.sample_rate);
         if self.sample_accumulator >= u64::from(NES_CPU_HZ) {
             self.sample_accumulator -= u64::from(NES_CPU_HZ);
-            let s = self.mix_sample();
-            self.samples.push(s);
+            let avg = self.mix_sum / self.mix_count as f32;
+            self.mix_sum = 0.0;
+            self.mix_count = 0;
+            let out = self.hp_alpha * (self.hp_prev_out + avg - self.hp_prev_in);
+            self.hp_prev_in = avg;
+            self.hp_prev_out = out;
+            self.samples.push(out);
+        }
+    }
+
+    /// Apply a pending `$4017` write: switch mode and restart the sequencer.
+    fn apply_frame_counter_mode(&mut self) {
+        let Some(mode) = self.pending_frame_mode.take() else {
+            return;
+        };
+        self.frame_mode = mode;
+        self.frame_cycle = 0;
+        // Mode 1 (5-step) issues an immediate quarter + half clock.
+        if mode == 1 {
+            self.clock_quarter_frame();
+            self.clock_half_frame();
         }
     }
 
@@ -817,6 +954,12 @@ impl Apu {
                     self.clock_half_frame();
                 } else if self.frame_cycle == FRAME_4STEP[2] {
                     self.clock_quarter_frame();
+                } else if self.frame_cycle == FRAME_4STEP[3] - 1 {
+                    // The frame IRQ flag is asserted on three consecutive
+                    // cycles: 29828, 29829 and 29830.
+                    if !self.frame_irq_inhibit {
+                        self.frame_irq = true;
+                    }
                 } else if self.frame_cycle == FRAME_4STEP[3] {
                     self.clock_quarter_frame();
                     self.clock_half_frame();
@@ -824,8 +967,6 @@ impl Apu {
                         self.frame_irq = true;
                     }
                 } else if self.frame_cycle >= FRAME_4STEP_WRAP {
-                    // Hardware also asserts IRQ on the wrap cycle, but the
-                    // observable effect is the same for our purposes.
                     if !self.frame_irq_inhibit {
                         self.frame_irq = true;
                     }

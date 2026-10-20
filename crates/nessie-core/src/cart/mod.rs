@@ -138,6 +138,11 @@ pub trait Mapper: Send {
     /// Advance the mapper's internal counters by `cycles` CPU cycles. Used by
     /// MMC3-style scanline IRQ counters.
     fn step(&mut self, _cycles: u32) {}
+    /// The PPU drove `addr` onto its address bus without a CHR access going
+    /// through [`Mapper::ppu_read`] / [`Mapper::ppu_write`] (a `$2006` write
+    /// or a `$2007` nametable/palette access). Mappers that watch PPU address
+    /// lines (MMC3's A12 scanline counter) override this.
+    fn ppu_address_changed(&mut self, _addr: u16) {}
     /// Borrowed view of battery-backed RAM if any.
     fn battery_ram(&self) -> Option<&[u8]> {
         None
