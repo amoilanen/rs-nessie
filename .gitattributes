@@ -1,0 +1,11 @@
+# Check text files out with LF on every platform. `rustfmt.toml` sets
+# `newline_style = "Unix"` and Prettier uses `endOfLine: lf`, so CRLF
+# checkouts (Git for Windows' default `core.autocrlf=true`) fail the
+# formatting gates.
+* text=auto eol=lf
+
+# Binary assets: never touch line endings.
+*.nes binary
+*.png binary
+*.ico binary
+*.icns binary
